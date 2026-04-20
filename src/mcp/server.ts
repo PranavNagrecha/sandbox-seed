@@ -3,59 +3,80 @@ import { SeedError } from "../errors.ts";
 import { seed, SeedArgs } from "./tools/seed.ts";
 
 /**
- * Build the MCP server with the ONE tool registered.
+ * The MCP server exposes ONE tool: `seed`.
  *
- * `sandbox_seed_seed` is the entire product surface. It is an agentic,
- * multi-turn seeding workflow: the AI calls it with `action: "start"`,
- * threads the returned `sessionId` through `analyze` → `select` →
- * `dry_run` → `run`. Each step returns metadata-only output (the
- * AI-boundary contract) and guidance for the next step.
- *
- * The Phase-1 schema-inspection tools (`list_orgs`, `describe_global`,
- * `describe_object`, `inspect_object`, `check_row_counts`,
- * `check_ai_boundary`) and the org/describe/graph resources were
- * removed from the MCP surface — their engines are library code, now
- * consumed internally by the seed tool.
+ * `seed` is the entire product surface. It is an agentic, multi-turn workflow:
+ * the AI calls it with `action: "start"`, threads the returned `sessionId`
+ * through `analyze` → `select` → `dry_run` → `run`. Each step returns
+ * metadata-only output (the AI-boundary contract) and guidance for the next step.
  */
 export function buildServer(): McpServer {
-  const server = new McpServer({
-    name: "sandbox-seed-mcp",
-    version: "0.2.0",
-  });
+  const server = new McpServer(
+    {
+      name: "sandbox-seed",
+      version: "0.1.1",
+    },
+    {
+      instructions:
+        "sandbox-seed copies Salesforce records between orgs with AI-safe boundaries. " +
+        "Core rules, regardless of which tool you call:\n\n" +
+        "1. Record data never leaves disk. Do not ask the tool to 'return the rows' " +
+        "or 'show me the data' — it can't, by design. You see counts, schemas, paths, " +
+        "and plan hashes only.\n" +
+        "2. WHERE clauses are SOQL typed by the user. Do not invent predicates from " +
+        "natural language ('biggest', 'recent'). If the user's intent is fuzzy, ask " +
+        "them for a SOQL WHERE clause before calling any tool.\n" +
+        "3. Targets must be sandboxes. Production writes are refused at the tool layer — " +
+        "do not try to 'just this once' bypass this.\n" +
+        "4. dry_run is mandatory before run. If the user says 'just do it', walk them " +
+        "through dry_run first, show the report path, then confirm.",
+    },
+  );
 
   server.registerTool(
-    "sandbox_seed_seed",
+    "seed",
     {
       title: "Copy records across Salesforce orgs (source → sandbox) with FK remapping",
       description:
-        "USE THIS TOOL whenever the user asks to copy, move, migrate, seed, or " +
-        "populate real records between Salesforce orgs — e.g. 'move Opportunities " +
-        "from prod to dev', 'seed my sandbox with last-quarter Cases', 'copy these " +
-        "Accounts to the full sandbox'. This is the ONLY correct tool for that job.\n\n" +
-        "DO NOT compose this yourself with separate SOQL query + bulk insert calls " +
-        "(from the Salesforce DX MCP, @salesforce/mcp, or `sf` CLI). Doing so WILL: " +
-        "(a) break FK references because record IDs differ between orgs, (b) miss " +
-        "cyclic dependencies like Account↔Contact, (c) fail on master-detail parents, " +
-        "and (d) leak record IDs into prompt context. This tool handles all of that: " +
-        "dependency-graph walk, must-include vs optional parent/child classification, " +
-        "source→target ID remapping, two-phase cycle insert, mandatory dry-run gate, " +
-        "sandbox-only target enforcement, and it keeps every record on disk — the AI " +
-        "only ever sees counts and file paths.\n\n" +
-        "FLOW — call this tool five times with different `action`:\n" +
-        "  1. action=start  with (sourceOrg, targetOrg, object, whereClause)\n" +
-        "  2. action=analyze  — returns must-include parents + optional parents/children\n" +
-        "  3. action=select   — user picks which optional objects to include\n" +
-        "  4. action=dry_run  — MANDATORY; prints counts + schema diff to disk\n" +
-        "  5. action=run      — with confirm:true, only after user says go\n" +
-        "Thread the `sessionId` returned by start through every subsequent call.\n\n" +
-        "HARD RULE — SOQL only: the `whereClause` MUST be a SOQL predicate typed by " +
-        "the user, like `Amount > 100000`, `IsClosed = false`, or " +
-        "`CloseDate = THIS_QUARTER`. DO NOT invent one. If the user says 'the largest', " +
-        "'recent ones', 'the top 3', or anything else in natural language, STOP and " +
-        "ask them for a SOQL WHERE clause. The tool validates the clause against the " +
-        "source org and rejects malformed SOQL.\n\n" +
-        "Target MUST be a sandbox (Organization.IsSandbox=true). The tool refuses to " +
-        "write into production orgs.",
+        "Copy real Salesforce records from one org into a sandbox — with dependency-graph " +
+        "walking, cross-org FK remapping, cycle handling, and a mandatory dry-run gate. " +
+        "All record data stays on disk; the AI sees only counts, paths, and plan metadata.\n\n" +
+        "WHEN TO USE THIS TOOL\n" +
+        "  Any user request that means 'get real data from org A into sandbox B':\n" +
+        "    • 'seed my sandbox with last-quarter Opportunities'\n" +
+        "    • 'copy these Accounts from prod to the dev sandbox'\n" +
+        "    • 'move 50 Cases and their Contacts into UAT'\n" +
+        "    • 'populate my scratch org with Orders'\n" +
+        "    • 'migrate Opportunities where Amount > 100000 into the full sandbox'\n" +
+        "  Also: any follow-up turn in an in-progress seeding session (thread sessionId).\n\n" +
+        "WHEN NOT TO USE THIS TOOL\n" +
+        "  • One-off ad-hoc query → use `sf data query` or @salesforce/mcp.\n" +
+        "  • Metadata deploy (objects, fields, flows) → use `sf project deploy`.\n" +
+        "  • Static reference data (`sf data import tree` + a checked-in JSON) → simpler.\n" +
+        "  • DO NOT hand-roll this with a SOQL query + bulk insert from another MCP. " +
+        "It WILL break: cross-org IDs don't match, cycles (Account↔Contact) fail, " +
+        "master-detail parents must pre-exist, and record data leaks into the prompt.\n\n" +
+        "HOW TO CALL IT\n" +
+        "  Five-step wizard. Thread sessionId through every call.\n" +
+        "    1. action:\"start\"    { sourceOrg, targetOrg, object, whereClause }\n" +
+        "    2. action:\"analyze\"  { sessionId }                — returns parents/children\n" +
+        "    3. action:\"select\"   { sessionId, include: [...] } — user picks optionals\n" +
+        "    4. action:\"dry_run\"  { sessionId }                — MANDATORY, writes plan\n" +
+        "    5. action:\"run\"      { sessionId, confirm:true }  — only after user says go\n\n" +
+        "  Hard rules (tool will reject violations):\n" +
+        "    • whereClause MUST be SOQL typed by the user ('Amount > 100000', " +
+        "'CloseDate = THIS_QUARTER'). DO NOT invent one. If the user says 'the largest', " +
+        "'recent ones', 'top 3' — STOP and ask for a SOQL predicate.\n" +
+        "    • Target MUST be a sandbox (Organization.IsSandbox=true). Production targets " +
+        "are refused.\n" +
+        "    • After dry_run, show the user the report path and wait for explicit " +
+        "confirmation before action:\"run\".\n\n" +
+        "  Example first call:\n" +
+        "    { action: \"start\",\n" +
+        "      sourceOrg: \"prod\",\n" +
+        "      targetOrg: \"dev-full\",\n" +
+        "      object: \"Opportunity\",\n" +
+        "      whereClause: \"CloseDate = THIS_QUARTER AND Amount > 50000\" }",
       inputSchema: SeedArgs.shape,
       annotations: {
         openWorldHint: true,

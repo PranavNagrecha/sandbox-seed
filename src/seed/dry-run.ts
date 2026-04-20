@@ -55,7 +55,7 @@ export async function runDryRun(opts: DryRunOptions): Promise<DryRunSummary> {
   if (rootIds.length === 0) {
     throw new UserError(
       `WHERE clause returned 0 records on ${opts.rootObject} — nothing to seed.`,
-      `Adjust the WHERE clause and call sandbox_seed_seed with action: "start" again.`,
+      `Adjust the WHERE clause and call seed with action: "start" again.`,
     );
   }
 
@@ -336,7 +336,7 @@ function renderReport(args: {
   lines.push(`---`);
   lines.push(``);
   lines.push(
-    `To execute the full seed, call sandbox_seed_seed with ` +
+    `To execute the full seed, call seed with ` +
       `\`{action: "run", sessionId: "<this-session>", confirm: true}\` within 24 hours.`,
   );
 
