@@ -100,19 +100,20 @@ The tests under `tests/mcp/` encode these rules — start there if you're auditi
 
 ---
 
-## What's shipped in 0.1.1
+## What's shipped in 0.2.0
 
 - **MCP `seed` tool** — five-step SF → SF copy flow (analyze → select → dry-run → confirm → run) with cross-org FK remapping, two-phase cycle inserts, validation-rule snapshot/restore, and the AI-boundary contract.
+- **Child + 1 user-selected lookups** (new in 0.2.0) — at `start`, name specific reference fields on direct children of the root; the walker follows each exactly one hop to pull that target object into scope. Multi-path objects (reachable via direct FK *and* child-lookup) union their ID sets rather than picking one path.
+- **Semi-joins in `whereClause` now supported** (fixed in 0.2.0) — root predicates like `Id IN (SELECT … FROM …)` work end-to-end. Root IDs are materialized once and spliced into downstream scopes as literal `Id IN ('…','…')`, sidestepping SOQL's one-level semi-join limit.
 - **CLI `inspect` command** — read-only schema and dependency-graph exploration (tree / mermaid / dot / json).
 - Salesforce CLI auth integration (reads `~/.sf/`).
 
-Not yet shipped: synthetic data generation, PII masking, CSV import, multi-target fan-out. These are roadmap, not 0.1.1.
+Not yet shipped: synthetic data generation, PII masking, CSV import, multi-target fan-out. These are roadmap, not 0.2.0.
 
-### Scope & limitations to know about in 0.1.1
+### Scope & limitations to know about in 0.2.0
 
 - **One session = one id-map.** The source→target ID map is session-scoped (written to the session dir). Seeds cannot yet be **composed across runs** — if you seed Accounts in one session and then seed Applications in a second session, the second session does not recognize the Accounts from the first. Required lookups are skipped; nillable lookups are inserted as `null`. Workaround: seed everything you need in a single session by rooting the seed on the highest shared object (e.g. Account), so the id-map is populated in dependency order within one run. A project-level id-map that composes across runs is on the roadmap.
-- **Children's parents are not walked.** The graph walker pulls the root's direct children but does not follow those children's *other* parent lookups. If the child has FKs to objects outside your current scope, they will be skipped or nulled. Workaround: root the seed on the child instead, so its parents are walked transitively.
-- **`whereClause` cannot contain a semi-join today.** A root predicate like `Id IN (SELECT … FROM …)` causes dry-run to fail because downstream probes wrap it in another `IN (SELECT …)`, which SOQL rejects. Workaround: root the seed on the inner object, or pre-query the IDs and pass them as `Id IN ('…','…')`.
+- **Child-lookup walking is one hop only, user-selected.** 0.2.0 walks user-named reference fields on direct children exactly one hop further. No transitive expansion, no auto-discovery. If you need a two-hop chain (child → parent → grandparent), root the seed on the child instead so its parents are walked transitively.
 
 ---
 
@@ -128,7 +129,7 @@ More: [docs/AUTH.md](docs/AUTH.md).
 
 ## Status
 
-Pre-release (`0.1.1`). APIs and flags may change before `1.0`. Use in sandboxes only — **never** point this at a production org as the target (the tool refuses, but don't test the refusal with real money).
+Pre-release (`0.2.0`). APIs and flags may change before `1.0`. Use in sandboxes only — **never** point this at a production org as the target (the tool refuses, but don't test the refusal with real money).
 
 Roadmap: [BACKLOG in project notes, soon to be moved into GitHub Issues].
 
