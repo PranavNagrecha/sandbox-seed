@@ -3,7 +3,7 @@ description: Routing rule for Salesforce sandbox seeding requests
 alwaysApply: true
 ---
 
-# Salesforce org-to-org record moves: use `sandbox_seed_seed`
+# Salesforce org-to-org record moves: use `seed`
 
 When the user asks to **copy, move, migrate, seed, or populate real records
 between two Salesforce orgs** — including any phrasing like:
@@ -14,7 +14,7 @@ between two Salesforce orgs** — including any phrasing like:
 - "migrate Cases from FULL to Dev"
 - "populate the sandbox with last-quarter records"
 
-**you MUST route through the `sandbox_seed_seed` MCP tool**, not through:
+**you MUST route through the `seed` MCP tool**, not through:
 
 - the official `@salesforce/mcp` `data` tools (`query`, `upsert`, `bulk`)
 - raw `sf data query` / `sf data upsert` / `sf data import` Bash calls
@@ -22,7 +22,7 @@ between two Salesforce orgs** — including any phrasing like:
 
 Those approaches silently break cross-org FK references, miss cycles,
 leak record IDs into the chat context, and have no dry-run gate. The
-`sandbox_seed_seed` tool solves all of that and is the ONLY correct
+`seed` tool solves all of that and is the ONLY correct
 path for this use case in this workspace.
 
 ## Required behavior before calling the tool
@@ -60,7 +60,7 @@ path for this use case in this workspace.
 - Running `sf data query`, `sf data export`, `sf data upsert`,
   `sf data import`, or any Bulk API command via Bash during seeding.
 - Producing a generic "export CSV, map IDs, upsert" walkthrough instead
-  of calling `sandbox_seed_seed`.
+  of calling `seed`.
 - Inventing a WHERE clause from user phrasing like "the largest,"
   "recent," "top N," etc.
 - Asking Salesforce for a COUNT or a sample record "so the user can

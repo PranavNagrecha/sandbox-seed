@@ -7,7 +7,7 @@ import { UserError } from "../errors.ts";
 /**
  * Session state for the agentic seed flow.
  *
- * MCP tool calls are stateless. The `sandbox_seed_seed` tool is multi-turn
+ * MCP tool calls are stateless. The `seed` tool is multi-turn
  * (start → analyze → select → dry_run → run), so we persist the session
  * between calls. The AI threads the `sessionId` through each call.
  *
@@ -116,7 +116,7 @@ export type Session = {
    *
    * Safety net: if the process dies between deactivate and reactivate,
    * the snapshot file `touched-validation-rules.json` remains in the
-   * session directory. The next `sandbox_seed_seed` call scans for that
+   * session directory. The next `seed` call scans for that
    * file across all sessions and refuses to start new work until the
    * user calls `action: "recover_validation_rules"` to reactivate.
    */
@@ -179,7 +179,7 @@ export class SessionStore {
     } catch {
       throw new UserError(
         `Session "${id}" not found.`,
-        "Call sandbox_seed_seed with action: \"start\" to create a new session.",
+        "Call seed with action: \"start\" to create a new session.",
       );
     }
     try {

@@ -15,7 +15,7 @@ import {
 } from "../fixtures/describes.ts";
 
 /**
- * AI-boundary enforcement for the `sandbox_seed_seed` MCP tool across
+ * AI-boundary enforcement for the `seed` MCP tool across
  * every action (start → analyze → select → dry_run).
  *
  * Every response field is metadata-only: object names, field names,
@@ -191,7 +191,7 @@ function findBoundaryViolations(
   return violations;
 }
 
-describe("sandbox_seed_seed: AI-boundary enforcement across actions", () => {
+describe("seed: AI-boundary enforcement across actions", () => {
   let sessionRoot: string;
   let cacheRoot: string;
 

@@ -47,7 +47,7 @@ export async function validateWhereClause(opts: {
     if (err instanceof ApiError && /MALFORMED_QUERY/i.test(err.message)) {
       throw new UserError(
         `Salesforce rejected your WHERE clause: ${err.message}`,
-        `Fix the SOQL predicate and call sandbox_seed_seed with action: "start" again.`,
+        `Fix the SOQL predicate and call seed with action: "start" again.`,
       );
     }
     throw err;

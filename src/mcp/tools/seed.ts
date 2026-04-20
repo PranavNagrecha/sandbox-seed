@@ -197,7 +197,7 @@ export async function seed(
       throw new UserError(
         `Refusing new work — ${pending.length} prior session(s) left target-org ` +
           `validation rule(s) deactivated:\n${list}`,
-        `Call sandbox_seed_seed with action: "recover_validation_rules", sessionId: "<id>" ` +
+        `Call seed with action: "recover_validation_rules", sessionId: "<id>" ` +
           `for each session above. Only then can you start/continue a seed flow.`,
       );
     }
@@ -354,9 +354,9 @@ async function doStart(
     nextAction: "analyze",
     guidance: sampleApplied
       ? `Matched ${matchedCount} ${session.rootObject} record(s) — sampled first ${scopeCount} ` +
-        `(ORDER BY Id). Next: call sandbox_seed_seed with action: "analyze".`
+        `(ORDER BY Id). Next: call seed with action: "analyze".`
       : `Scope: ${scopeCount} ${session.rootObject} record(s) in ${session.sourceOrg} match the WHERE clause. ` +
-        `Confirm this is the scope the user wanted, then call sandbox_seed_seed with action: "analyze".`,
+        `Confirm this is the scope the user wanted, then call seed with action: "analyze".`,
   };
 }
 
@@ -455,7 +455,7 @@ async function doAnalyze(
       `Optional children (${classification.optionalChildren.length}): ${arrOrNone(classification.optionalChildren)}.` +
       hiddenHint +
       ` Ask the user which optional parents and children to include, then call ` +
-      `sandbox_seed_seed with action: "select".`,
+      `seed with action: "select".`,
   };
 }
 
@@ -472,7 +472,7 @@ async function doSelect(
   if (session.mustIncludeParents === undefined) {
     throw new UserError(
       `Session "${session.id}" has not been analyzed yet.`,
-      `Call sandbox_seed_seed with action: "analyze" first.`,
+      `Call seed with action: "analyze" first.`,
     );
   }
 
@@ -534,7 +534,7 @@ async function doSelect(
     nextAction: "dry_run",
     guidance:
       `Final load order (${finalObjectList.length} object(s)): ${finalLoadOrder.join(" → ")}. ` +
-      `Next: call sandbox_seed_seed with action: "dry_run" — this is mandatory before you can run.`,
+      `Next: call seed with action: "dry_run" — this is mandatory before you can run.`,
   };
 }
 
@@ -551,7 +551,7 @@ async function doDryRun(
   if (session.finalObjectList === undefined) {
     throw new UserError(
       `Session "${session.id}" has not reached the select step yet.`,
-      `Call sandbox_seed_seed with action: "select" first.`,
+      `Call seed with action: "select" first.`,
     );
   }
 
@@ -698,7 +698,7 @@ async function doDryRun(
     nextAction: "run",
     guidance:
       `Dry run complete. ${summary.totalRecords} record(s) total.${upsertSuffix}${schemaSuffix}${vrSuffix} ` +
-      `Review ${summary.reportPath}. When the user confirms, call sandbox_seed_seed ` +
+      `Review ${summary.reportPath}. When the user confirms, call seed ` +
       `with action: "run", confirm: true.`,
   };
 }
@@ -723,7 +723,7 @@ async function doRun(
     const hours = Math.round(DRY_RUN_FRESHNESS_MS / 3_600_000);
     throw new UserError(
       `No fresh dry run on session "${session.id}" — one is mandatory within ${hours}h before run.`,
-      `Call sandbox_seed_seed with action: "dry_run" first.`,
+      `Call seed with action: "dry_run" first.`,
     );
   }
   if (session.finalObjectList === undefined || session.finalObjectList.length === 0) {
