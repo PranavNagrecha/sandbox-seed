@@ -60,7 +60,7 @@ export class DescribeCache {
       // testing on a long-lived cache.
       if ((entry.schema ?? 0) < CACHE_SCHEMA_VERSION) return null;
       const age = Date.now() - entry.fetchedAt;
-      if (age > this.ttlMillis) return null;
+      if (age >= this.ttlMillis) return null;
       return entry.describe;
     } catch {
       return null;
