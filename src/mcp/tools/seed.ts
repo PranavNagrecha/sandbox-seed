@@ -26,6 +26,7 @@ import {
   reactivateFromSnapshot,
 } from "../../seed/validation-rule-toggle.ts";
 import { queryActiveValidationRules } from "../../describe/tooling-client.ts";
+import { isReference } from "../../describe/types.ts";
 
 /**
  * The ONE MCP tool.
@@ -148,6 +149,17 @@ export const SeedArgs = z.object({
         "and reactivate, the next tool call refuses new work until the user runs " +
         "`action: \"recover_validation_rules\"`. Default false.",
     ),
+  childLookups: z
+    .record(z.string().min(1), z.array(z.string().min(1)).min(1))
+    .optional()
+    .describe(
+      "For action=start. Per-child-object lookup fields to walk exactly ONE hop " +
+        "to their direct parent (no transitive recursion). Key = child object API " +
+        "name (must be a 1-level child of the root), value = list of reference " +
+        "field names on that child. Example: { Contact: ['ReportsToId'] } when " +
+        "root=Account seeds the referenced Contact records so ReportsToId resolves " +
+        "instead of nulling. Per-run; the user selects which lookups each time.",
+    ),
 });
 
 export type SeedArgsT = z.infer<typeof SeedArgs>;
@@ -268,6 +280,48 @@ async function doStart(
     );
   }
 
+  // Validate childLookups: each key must be a 1-level child of root (declared
+  // in root's childRelationships), and each listed field must exist and be a
+  // reference on that child's describe. Fail fast with the offending name.
+  if (args.childLookups !== undefined) {
+    const rootDesc = await sourceDesc.describeObject(args.object!);
+    const rootChildTypes = new Set(
+      (rootDesc.childRelationships ?? []).map((c) => c.childSObject),
+    );
+    for (const [childObj, fieldNames] of Object.entries(args.childLookups)) {
+      if (!known.has(childObj)) {
+        throw new UserError(
+          `childLookups references unknown object "${childObj}".`,
+          `Check spelling. Custom objects need the __c suffix.`,
+        );
+      }
+      if (!rootChildTypes.has(childObj)) {
+        throw new UserError(
+          `childLookups object "${childObj}" is not a 1-level child of ${args.object}.`,
+          `Only objects that appear in ${args.object}'s childRelationships are valid. ` +
+            `Child+1 walks one hop from a direct child — it does not walk deeper.`,
+        );
+      }
+      const childDesc = await sourceDesc.describeObject(childObj);
+      const fieldByName = new Map(childDesc.fields.map((f) => [f.name, f]));
+      for (const fname of fieldNames) {
+        const field = fieldByName.get(fname);
+        if (field === undefined) {
+          throw new UserError(
+            `childLookups field "${childObj}.${fname}" does not exist.`,
+            `Check spelling. Field names are case-sensitive.`,
+          );
+        }
+        if (!isReference(field)) {
+          throw new UserError(
+            `childLookups field "${childObj}.${fname}" is not a reference/lookup field (type=${field.type}).`,
+            `Only reference fields can be walked.`,
+          );
+        }
+      }
+    }
+  }
+
   // Validate WHERE clause by running SELECT COUNT() against source.
   const matchedCount = await validateWhereClause({
     auth: sourceAuth,
@@ -334,6 +388,7 @@ async function doStart(
     limit,
     scopeCount,
     disableValidationRulesOnRun: args.disableValidationRulesOnRun === true,
+    childLookups: args.childLookups,
   });
 
   return {
@@ -350,6 +405,7 @@ async function doStart(
       limit,
       sampleApplied,
       disableValidationRulesOnRun: session.disableValidationRulesOnRun === true,
+      childLookups: session.childLookups ?? {},
     },
     nextAction: "analyze",
     guidance: sampleApplied
@@ -382,6 +438,7 @@ async function doAnalyze(
     bypassCache: false,
     cacheRoot: overrides.cacheRoot,
     fetchFn: overrides.fetchFn,
+    childLookups: session.childLookups,
   });
 
   const classification = classifyForSeed({
@@ -413,6 +470,7 @@ async function doAnalyze(
   session.optionalChildren = classification.optionalChildren;
   session.cycles = cycles;
   session.analyzedLoadOrder = fullLoadOrder;
+  session.childLookupTargets = result.childLookupTargets;
   session.step = "analyzed";
   await store.save(session);
 
@@ -447,6 +505,8 @@ async function doAnalyze(
         objects: c.objects,
         breakEdge: c.breakEdge,
       })),
+      childLookups: session.childLookups ?? {},
+      childLookupTargets: result.childLookupTargets,
     },
     nextAction: "select",
     guidance:
@@ -490,11 +550,16 @@ async function doSelect(
     );
   }
 
+  // Auto-include child-lookup targets the user opted into at `start` —
+  // they shouldn't have to re-select what they already declared. See
+  // session.childLookupTargets populated in doAnalyze.
+  const autoChildLookupTargets = session.childLookupTargets ?? [];
   const finalObjectList = [
     session.rootObject,
     ...(session.mustIncludeParents ?? []),
     ...chosenParents,
     ...chosenChildren,
+    ...autoChildLookupTargets,
   ].filter((v, i, a) => a.indexOf(v) === i);
 
   // Recompute a restricted load order. We re-run inspect to get the live
@@ -510,6 +575,7 @@ async function doSelect(
     bypassCache: false,
     cacheRoot: overrides.cacheRoot,
     fetchFn: overrides.fetchFn,
+    childLookups: session.childLookups,
   });
   const restrictedPlan = computeLoadOrder(result.graph, { requestedObjects: finalObjectList });
   const finalLoadOrder = loadOrderObjects(restrictedPlan.steps);
@@ -602,6 +668,7 @@ async function doDryRun(
     finalObjectList: session.finalObjectList,
     sessionDir: store.sessionDir(session.id),
     fetchFn: overrides.fetchFn,
+    childLookups: session.childLookups,
   });
 
   // If this session opted into deactivating target-org validation rules
@@ -790,6 +857,7 @@ async function doRun(
       sessionId: session.id,
       targetOrgAlias: session.targetOrg,
       upsertDecisions: session.dryRun?.upsertDecisions,
+      childLookups: session.childLookups,
     });
   } catch (err) {
     session.lastError = err instanceof Error ? err.message : String(err);

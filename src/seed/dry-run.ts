@@ -7,7 +7,6 @@ import { UserError } from "../errors.ts";
 import {
   chunkIds,
   computeScopePaths,
-  queryCount,
   queryIds,
   soqlIdList,
   type ScopePath,
@@ -39,10 +38,25 @@ export type DryRunOptions = {
   finalObjectList: string[];
   sessionDir: string;
   fetchFn?: typeof fetch;
+  /** See src/seed/extract.ts ScopePath kind="child-lookup". */
+  childLookups?: Record<string, string[]>;
 };
 
 export async function runDryRun(opts: DryRunOptions): Promise<DryRunSummary> {
-  const scopePaths = computeScopePaths(opts.graph, opts.rootObject, opts.finalObjectList);
+  const allPaths = computeScopePaths(
+    opts.graph,
+    opts.rootObject,
+    opts.finalObjectList,
+    opts.childLookups,
+  );
+  // Group paths by object — an object may be reachable via multiple paths
+  // (e.g. direct-parent AND child-lookup). Counts union the ID sets.
+  const pathsByObject = new Map<string, ScopePath[]>();
+  for (const p of allPaths) {
+    const list = pathsByObject.get(p.object) ?? [];
+    list.push(p);
+    pathsByObject.set(p.object, list);
+  }
 
   // Materialize root scope IDs — we need them to resolve transitive parents,
   // and we write a sample into the report for the user.
@@ -62,23 +76,35 @@ export async function runDryRun(opts: DryRunOptions): Promise<DryRunSummary> {
   const perObjectCounts: Record<string, number> = {};
   const perObjectSoql: Record<string, string> = {};
   const perObjectKind: Record<string, string> = {};
-  // Cache of materialized IDs per object, for transitive chain resolution.
   const materializedIds = new Map<string, string[]>();
   materializedIds.set(opts.rootObject, rootIds);
 
-  for (const path of scopePaths) {
-    const { count, soql } = await countForPath({
-      auth: opts.sourceAuth,
-      rootObject: opts.rootObject,
-      whereClause: opts.whereClause,
-      rootIds,
-      path,
-      materializedIds,
-      fetchFn: opts.fetchFn,
-    });
-    perObjectCounts[path.object] = count;
-    perObjectSoql[path.object] = soql;
-    perObjectKind[path.object] = path.kind;
+  for (const [object, paths] of pathsByObject) {
+    const unionedIds = new Set<string>();
+    const soqlPieces: string[] = [];
+    const kinds: string[] = [];
+    for (const path of paths) {
+      const res = await idsForPath({
+        auth: opts.sourceAuth,
+        rootObject: opts.rootObject,
+        whereClause: opts.whereClause,
+        rootIds,
+        path,
+        materializedIds,
+        fetchFn: opts.fetchFn,
+      });
+      for (const id of res.ids) unionedIds.add(id);
+      soqlPieces.push(`-- path kind=${path.kind}\n${res.soql}`);
+      kinds.push(path.kind);
+    }
+    perObjectCounts[object] = unionedIds.size;
+    perObjectSoql[object] = soqlPieces.join("\n\n");
+    perObjectKind[object] = kinds.join("+");
+    // Make the union IDs available to transitive chains that might depend
+    // on this object later (rare but possible).
+    if (unionedIds.size > 0) {
+      materializedIds.set(object, [...unionedIds]);
+    }
   }
 
   // Schema diff against target. Flag any missing object or createable
@@ -155,7 +181,7 @@ export async function runDryRun(opts: DryRunOptions): Promise<DryRunSummary> {
   };
 }
 
-async function countForPath(opts: {
+async function idsForPath(opts: {
   auth: OrgAuth;
   rootObject: string;
   whereClause: string;
@@ -163,67 +189,70 @@ async function countForPath(opts: {
   path: ScopePath;
   materializedIds: Map<string, string[]>;
   fetchFn?: typeof fetch;
-}): Promise<{ count: number; soql: string }> {
+}): Promise<{ ids: string[]; soql: string }> {
   const { path } = opts;
 
   if (path.kind === "root") {
-    const soql = `SELECT COUNT() FROM ${path.object} WHERE ${opts.whereClause}`;
-    const count = opts.rootIds.length;
-    return { count, soql };
+    const soql = `SELECT Id FROM ${path.object} WHERE ${opts.whereClause}`;
+    return { ids: opts.rootIds, soql };
   }
 
   if (path.kind === "direct-parent" && path.rootFk !== undefined) {
-    const soql = `SELECT COUNT() FROM ${path.object} WHERE Id IN (SELECT ${path.rootFk} FROM ${opts.rootObject} WHERE ${opts.whereClause})`;
-    const count = await queryCount({
-      auth: opts.auth,
-      object: path.object,
-      whereClause: `Id IN (SELECT ${path.rootFk} FROM ${opts.rootObject} WHERE ${opts.whereClause})`,
-      fetchFn: opts.fetchFn,
-    });
-    // Materialize the parent IDs in case something transitive depends on this.
-    const ids = await queryIds({
-      auth: opts.auth,
-      soql: `SELECT Id FROM ${path.object} WHERE Id IN (SELECT ${path.rootFk} FROM ${opts.rootObject} WHERE ${opts.whereClause})`,
-      fetchFn: opts.fetchFn,
-    });
-    opts.materializedIds.set(path.object, ids);
-    return { count, soql };
+    const idList = soqlIdList(opts.rootIds);
+    if (idList.length === 0) {
+      return {
+        ids: [],
+        soql: `-- direct-parent ${path.object} via ${path.rootFk}: root scope is empty`,
+      };
+    }
+    const whereClause = `Id IN (SELECT ${path.rootFk} FROM ${opts.rootObject} WHERE Id IN (${idList}))`;
+    const soql = `SELECT Id FROM ${path.object} WHERE ${whereClause}`;
+    const ids = await queryIds({ auth: opts.auth, soql, fetchFn: opts.fetchFn });
+    return { ids, soql };
   }
 
   if (path.kind === "direct-child" && path.childFk !== undefined) {
-    const soql = `SELECT COUNT() FROM ${path.object} WHERE ${path.childFk} IN (SELECT Id FROM ${opts.rootObject} WHERE ${opts.whereClause})`;
-    const count = await queryCount({
-      auth: opts.auth,
-      object: path.object,
-      whereClause: `${path.childFk} IN (SELECT Id FROM ${opts.rootObject} WHERE ${opts.whereClause})`,
-      fetchFn: opts.fetchFn,
-    });
-    return { count, soql };
+    const idList = soqlIdList(opts.rootIds);
+    if (idList.length === 0) {
+      return {
+        ids: [],
+        soql: `-- direct-child ${path.object} via ${path.childFk}: root scope is empty`,
+      };
+    }
+    const whereClause = `${path.childFk} IN (${idList})`;
+    const soql = `SELECT Id FROM ${path.object} WHERE ${whereClause}`;
+    const ids = await queryIds({ auth: opts.auth, soql, fetchFn: opts.fetchFn });
+    return { ids, soql };
+  }
+
+  if (
+    path.kind === "child-lookup" &&
+    path.childObject !== undefined &&
+    path.lookupField !== undefined &&
+    path.childFkToRoot !== undefined
+  ) {
+    const idList = soqlIdList(opts.rootIds);
+    if (idList.length === 0) {
+      return {
+        ids: [],
+        soql: `-- child-lookup ${path.object} via ${path.childObject}.${path.lookupField}: root scope is empty`,
+      };
+    }
+    const whereClause =
+      `Id IN (SELECT ${path.lookupField} FROM ${path.childObject} ` +
+      `WHERE ${path.childFkToRoot} IN (${idList}))`;
+    const soql = `SELECT Id FROM ${path.object} WHERE ${whereClause}`;
+    const ids = await queryIds({ auth: opts.auth, soql, fetchFn: opts.fetchFn });
+    return { ids, soql };
   }
 
   if (path.kind === "transitive" && Array.isArray(path.chain) && path.chain.length >= 3) {
-    // Walk the chain, materializing each intermediate's IDs, then count the
-    // final object scoped by IN (<ids>) of the previous hop.
-    // chain is [root, ..., path.object].
-    let prevObject = path.chain[0];
-    let prevIds = opts.materializedIds.get(prevObject) ?? opts.rootIds;
-    for (let i = 1; i < path.chain.length; i++) {
-      const currObject = path.chain[i];
-      // We need the FK field from prevObject to currObject. The chain came
-      // from traversing parent edges source→target, so: edge source=prev,
-      // target=curr. But we don't have the graph here — we passed only
-      // `chain`. Bail: v1 doesn't fully support transitive chains.
-      // Record best-effort count: 0, flag in report.
-      void currObject;
-    }
-    void prevIds;
     const soql = `-- transitive chain ${path.chain.join(" → ")} not yet supported for count`;
-    return { count: 0, soql };
+    return { ids: [], soql };
   }
 
-  // unknown or unsupported
   return {
-    count: 0,
+    ids: [],
     soql: `-- no known path from ${opts.rootObject} to ${path.object}; skipped`,
   };
 }

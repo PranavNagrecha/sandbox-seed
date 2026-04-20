@@ -157,6 +157,22 @@ export const CONTACT: SObjectDescribe = {
   ],
 };
 
+export const CONTACT_WITH_REPORTS_TO: SObjectDescribe = {
+  ...CONTACT,
+  fields: [
+    ...CONTACT.fields,
+    {
+      name: "ReportsToId",
+      type: "reference",
+      referenceTo: ["Contact"],
+      relationshipName: "ReportsTo",
+      nillable: true,
+      custom: false,
+      createable: true,
+    },
+  ],
+};
+
 export const OPPORTUNITY: SObjectDescribe = {
   name: "Opportunity",
   label: "Opportunity",
@@ -184,6 +200,35 @@ export const OPPORTUNITY: SObjectDescribe = {
       custom: false,
       createable: true,
     },
+  ],
+};
+
+export const OPPORTUNITY_WITH_PRICEBOOK: SObjectDescribe = {
+  ...OPPORTUNITY,
+  fields: [
+    ...OPPORTUNITY.fields,
+    {
+      name: "Pricebook2Id",
+      type: "reference",
+      referenceTo: ["Pricebook2"],
+      relationshipName: "Pricebook2",
+      nillable: true,
+      custom: false,
+      createable: true,
+    },
+  ],
+};
+
+export const PRICEBOOK2: SObjectDescribe = {
+  name: "Pricebook2",
+  label: "Price Book",
+  custom: false,
+  queryable: true,
+  createable: true,
+  fields: [
+    { name: "Id", type: "id", nillable: false, custom: false, createable: false },
+    { name: "Name", type: "string", nillable: false, custom: false, createable: true },
+    { name: "IsActive", type: "boolean", nillable: false, custom: false, createable: true },
   ],
 };
 

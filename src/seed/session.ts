@@ -121,6 +121,21 @@ export type Session = {
    * user calls `action: "recover_validation_rules"` to reactivate.
    */
   disableValidationRulesOnRun?: boolean;
+  /**
+   * User-selected child-lookup fields to walk one hop further. Key = child
+   * object API name (must be a direct child of root). Value = list of
+   * reference-field names on that child whose targets should be seeded
+   * too. See src/inspect/run.ts walkFromRoot() "Phase 2" and
+   * src/seed/extract.ts ScopePath kind="child-lookup" for downstream use.
+   */
+  childLookups?: Record<string, string[]>;
+  /**
+   * Object API names that were pulled into the graph by resolving
+   * `childLookups`. Populated at `analyze` time. Used by `select` to
+   * auto-union these into `finalObjectList` so the user doesn't have
+   * to re-select what they already opted into at `start`.
+   */
+  childLookupTargets?: string[];
   /** If the user retries a step after an error, the last error is stored here. */
   lastError?: string;
 };
