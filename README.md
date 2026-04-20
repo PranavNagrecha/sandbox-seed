@@ -46,6 +46,11 @@ Restart your host. Then try:
 
 The model will call the `seed` tool and walk you through the five-step flow (analyze → select → dry-run → confirm → run). No record data ever appears in chat.
 
+**What to expect on first run:**
+- `analyze` on a standard object (Case, Opportunity) against a managed-package-heavy org: **30–90 seconds** cold, ~1–3 seconds warm. The delay is one sequential describe per object in the dependency graph (~20–40 describes for Case). Describes cache at `.sandbox-seeding/cache/` with a 24h TTL.
+- `extract` rate depends on record count × relationship breadth; small seeds (<500 rows) finish in seconds.
+- Sessions live at `~/.sandbox-seed/sessions/` and are garbage-collected after 7 days. The cross-run project id-map at `~/.sandbox-seed/id-maps/` is persistent.
+
 For deeper MCP config, tool reference, and host-specific tips, see [docs/MCP.md](docs/MCP.md).
 
 ---
@@ -181,6 +186,7 @@ Roadmap: [BACKLOG in project notes, soon to be moved into GitHub Issues].
 
 ## Documentation
 
+- [docs/LIMITATIONS.md](docs/LIMITATIONS.md) — what the tool **doesn't** do today (read before adopting)
 - [docs/MCP.md](docs/MCP.md) — MCP server setup, tool reference, host-specific notes
 - [docs/CLI.md](docs/CLI.md) — CLI command reference
 - [docs/AI_BOUNDARY.md](docs/AI_BOUNDARY.md) — the boundary contract, in depth

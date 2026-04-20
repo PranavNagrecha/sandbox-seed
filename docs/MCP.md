@@ -131,6 +131,75 @@ Every response shape:
 
 ---
 
+## `playbook` (chain multiple seeds)
+
+For repeatable multi-step flows (e.g. "after every sandbox refresh, seed Accounts → Contacts → Opps → Tasks"), register a YAML playbook and run it through the `playbook` tool.
+
+### Where playbooks live
+
+**User scope only.** Playbooks are read from `~/.sandbox-seed/playbooks/<name>.yml`. There is no project-scoped or team-scoped playbook directory by design — playbooks describe workstation-level workflows, not repo content.
+
+### Schema
+
+```yaml
+apiVersion: sandbox-seed/v1
+kind: Playbook
+name: demo-refresh
+description: Seed the dev-full sandbox with a week's worth of real activity.
+defaults:
+  sourceOrg: prod
+  targetOrg: dev-full
+  disableValidationRulesOnRun: true
+steps:
+  - name: accounts
+    object: Account
+    whereClause: CreatedDate = LAST_N_DAYS:7
+    limit: 200
+  - name: contacts
+    object: Contact
+    whereClause: Account.CreatedDate = LAST_N_DAYS:7
+    limit: 500
+  - name: opportunities
+    object: Opportunity
+    whereClause: CloseDate = THIS_QUARTER AND Amount > 50000
+    continueOnError: true
+```
+
+Every field on a step is the same shape the `seed` tool accepts at `start` — `object`, `whereClause`, `limit`, `sampleSize`, `includeOptionalParents`, `includeOptionalChildren`, `childLookups`, `disableValidationRulesOnRun`, `isolateIdMap`. Step-level fields override `defaults`. See [src/playbook/types.ts](../src/playbook/types.ts) for the full schema.
+
+`continueOnError: true` on a step means a failure logs and proceeds to the next step. Default is abort-on-first-error so the user can fix and re-run from a known state.
+
+### Actions
+
+| Action | Args | What it does |
+|---|---|---|
+| `list` | (none) | Enumerate playbooks under `~/.sandbox-seed/playbooks/`, report any parse errors |
+| `dry_run` | `name` | Drive every step through `start → analyze → select → dry_run`, write ONE aggregated report, return a `playbookRunId` |
+| `run` | `playbookRunId`, `confirm: true` | Execute every step in order against its saved session. Refuses without a recent (< 24h) dry-run |
+
+Cross-step FK stitching happens automatically via the persistent project-level id-map at `~/.sandbox-seed/id-maps/<source>__<target>.json`. If step 1 seeds Accounts and step 2 seeds Contacts with a lookup to Account, step 2's Contact inserts resolve to the Account target IDs that step 1 just produced.
+
+The aggregated dry-run report is at `~/.sandbox-seed/playbook-runs/<playbookRunId>/aggregated-dry-run.md`, with per-step session reports still living under `~/.sandbox-seed/sessions/<sessionId>/`. The MCP response references these by path only — no record data in the envelope.
+
+### Example flow
+
+```json
+{ "action": "list" }
+```
+→ returns available playbook names.
+
+```json
+{ "action": "dry_run", "name": "demo-refresh" }
+```
+→ returns `playbookRunId` and `aggregateReportPath`. Review the report.
+
+```json
+{ "action": "run", "playbookRunId": "<id>", "confirm": true }
+```
+→ executes every step.
+
+---
+
 ## Validation-rule recovery
 
 When you call `start` with `disableValidationRulesOnRun: true`, the `run` step:
@@ -210,6 +279,47 @@ The tool checks `Organization.IsSandbox = true` on the target. If you're trying 
 ### "stdio JSON parse error" / weird host crashes
 
 The MCP transport is stdio-based. Anything written to `stdout` other than valid JSON-RPC corrupts the channel. If you're hacking on the server, never `console.log` — use `console.error` (stderr is fine).
+
+### "INVALID_SESSION_ID" or "Token expired" mid-run
+
+The Salesforce access token in `~/.sf/` expired while the seed was executing. The tool does not refresh mid-run. Re-login (`sf org login web --alias <name>`) for whichever org errored, then re-invoke the flow. If the error fired during `run`, the session's already-inserted rows are preserved in the project id-map, so re-running the same session picks up where it stopped (upsert-keyed objects match-and-update; non-keyed objects skip via cross-run dedup).
+
+### `INVALID_CROSS_REFERENCE_KEY` on insert
+
+Usually one of three causes. Check `execute.log` — the tool annotates this specific error with suspected causes.
+
+1. **Stale project id-map entry.** A prior run seeded a target row; that row has since been deleted out-of-band (manual cleanup, a partial sandbox refresh, another data loader). The map still points at the dead target id. `execute.log` surfaces the specific `projectMap[<object>:<sourceId>]→<targetId>` entries that are suspect. Recovery: re-run with `isolateIdMap: true` once to rebuild the map against the current target state.
+2. **Unmapped standard-root FK** (OwnerId, unmapped RecordTypeId, BusinessHoursId). The tool omits these on insert by default so Salesforce's default-picker fills them, but a picklist-strict org can still reject. Solution: pre-populate the id-map with an explicit mapping.
+3. **Cycle phase 2 PATCH failure.** Happens when the break-edge target record insert itself failed. Fix the underlying phase-1 error first.
+
+### `DUPLICATE_VALUE` on re-run
+
+The object has no upsert key configured, and the target rows (matched by some unique field the source defines) already exist from a prior seed. Two paths:
+
+- **Give it an upsert key.** Set an external-id field on the object in the target org's schema and populate it in source. The tool auto-routes objects with a picked upsert key through composite UPSERT (match-and-update) rather than INSERT.
+- **Clean the target.** Run against a fresh sandbox or delete the duplicate rows.
+
+### `MALFORMED_QUERY` from your WHERE clause
+
+User-typed SOQL syntax error — the predicate didn't validate against the source org. Test it in Workbench or `sf data query --query "SELECT Id FROM <object> WHERE <your-clause>"` before calling the tool.
+
+### Plan-hash mismatch on `run`
+
+The `dry_run` you ran earlier produced a plan hash the tool verifies before `run` executes. If the hash doesn't match, something changed between the two (different scope, different `includeOptional*`, re-ran dry_run with different args). The fix is always the same: re-run `dry_run` with your current intended args, then `run` against that fresh hash.
+
+### Session accumulation / first-run latency
+
+Sessions live at `~/.sandbox-seed/sessions/` and are GC'd after 7 days. If you run dozens per day, expect the directory to grow — the GC catches up. To clear everything manually: `rm -rf ~/.sandbox-seed/sessions`.
+
+Cold-run `analyze` against a managed-package-heavy org is slow (30–90s) because describes are sequential. The describe cache at `.sandbox-seeding/cache/` (repo-root by default) has a 24h TTL — subsequent analyses are near-instant.
+
+### Composite insert returned `ok: true` but per-row errors
+
+The composite endpoint responds 200 OK even when individual rows fail. The tool counts these into the `errors` bucket, but the overall action reports `ok: true` because the *call* succeeded. Always read `execute.log` for per-row results — the summary counts are accurate but not the whole story.
+
+### Sandbox refresh invalidated my project id-map
+
+Every run snapshots the target's `Organization.Id` and `LastRefreshDate` into `<source>__<target>.meta.json`. If either changes between runs, the map is archived to `<file>.stale-<timestamp>.org-refresh.json` (or `.org-mismatch.json`) and load returns empty. The archive is kept for postmortem — delete it when you're sure you don't need it.
 
 ---
 
