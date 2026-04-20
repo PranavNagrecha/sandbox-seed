@@ -1,0 +1,28 @@
+# Build output
+dist/
+oclif.manifest.json
+coverage/
+
+# Dependencies
+node_modules/
+
+# Runtime / session state
+.sandbox-seeding/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+
+# IDE / agent-local state (not for public repo)
+.claude/
+.graphifyignore
+graphify-out/
+
+# Internal working docs (not for public repo)
+notes/
+research/
+phases/
+MCP_DISCOVERY_RESEARCH.md
+MCP_NAMING_AND_DESCRIPTIONS.md
