@@ -27,3 +27,6 @@ phases/
 REQUIREMENTS.md
 MCP_DISCOVERY_RESEARCH.md
 MCP_NAMING_AND_DESCRIPTIONS.md
+
+# Local one-shot drivers (operator-only, not for public repo)
+scripts/drive-seed-fix.mjs

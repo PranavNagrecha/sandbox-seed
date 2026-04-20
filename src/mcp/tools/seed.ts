@@ -1142,14 +1142,25 @@ export async function getTargetIdentity(opts: {
   fetchFn?: typeof fetch;
 }): Promise<{ orgId: string; lastRefreshDate: string | null }> {
   const fetchFn = opts.fetchFn ?? fetch;
-  const soql = `SELECT Id, LastRefreshDate FROM Organization LIMIT 1`;
-  const url = `${opts.auth.instanceUrl}/services/data/v${opts.auth.apiVersion}/query?q=${encodeURIComponent(soql)}`;
-  const res = await salesforceFetch(fetchFn, url, {
-    headers: {
-      Authorization: `Bearer ${opts.auth.accessToken}`,
-      Accept: "application/json",
-    },
-  });
+  const query = async (soql: string) => {
+    const url = `${opts.auth.instanceUrl}/services/data/v${opts.auth.apiVersion}/query?q=${encodeURIComponent(soql)}`;
+    return salesforceFetch(fetchFn, url, {
+      headers: {
+        Authorization: `Bearer ${opts.auth.accessToken}`,
+        Accept: "application/json",
+      },
+    });
+  };
+
+  // LastRefreshDate only exists on Organization for some orgs/editions.
+  // If the field isn't queryable (INVALID_FIELD → HTTP 400), fall back
+  // to Id-only; the project-id-map still catches org swaps via orgId.
+  let res = await query(`SELECT Id, LastRefreshDate FROM Organization LIMIT 1`);
+  let lastRefreshSupported = true;
+  if (!res.ok && res.status === 400) {
+    res = await query(`SELECT Id FROM Organization LIMIT 1`);
+    lastRefreshSupported = false;
+  }
   if (!res.ok) {
     throw new ApiError(
       `Could not read target Organization identity (HTTP ${res.status}).`,
@@ -1166,7 +1177,10 @@ export async function getTargetIdentity(opts: {
       "Re-authenticate the target org and retry.",
     );
   }
-  return { orgId: rec.Id, lastRefreshDate: rec.LastRefreshDate ?? null };
+  return {
+    orgId: rec.Id,
+    lastRefreshDate: lastRefreshSupported ? (rec.LastRefreshDate ?? null) : null,
+  };
 }
 
 // Silence unused-import warnings for helpers consumed only inside dry-run /
