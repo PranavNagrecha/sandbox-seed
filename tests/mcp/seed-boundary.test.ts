@@ -16,17 +16,19 @@ import {
 
 /**
  * AI-boundary enforcement for the `seed` MCP tool across
- * every action (start → analyze → select → dry_run).
+ * every action (start → analyze → select → dry_run → run).
  *
  * Every response field is metadata-only: object names, field names,
  * counts, file paths, enums. No record IDs, no field values. This test
  * drives the full multi-turn flow against a mocked Salesforce API and
  * scans every response for record-ID-shaped strings and forbidden keys.
  *
- * The `run` action is not exercised here — it writes real composite
- * inserts which require a lot more mock surface. Its boundary is
- * covered by construction: it returns only `totalInserted`,
- * `insertedCounts`, `errorCount`, and disk paths.
+ * The `run` action is exercised with `isolateIdMap: true` so the
+ * persistent project-level id-map at `~/.sandbox-seed/` is untouched
+ * by the test. The mocked source returns zero rows for scope queries
+ * beyond root-Id materialization, so composite inserts are never
+ * issued — but the response still covers every field `doRun` emits
+ * (totalInserted, insertedCounts, errorCount, log/id-map paths).
  */
 
 const OBJECTS = {
@@ -156,10 +158,24 @@ function makeFetch(): typeof fetch {
 
     if (/\/query\?q=/.test(u)) {
       // Catch-all count response for scope probes we didn't special-case.
+      // Also the catch-all for seedSingle's `SELECT <fields> FROM ...`
+      // field-materialization during `run` — zero rows means no composite
+      // insert is ever issued by this test.
       return new Response(
         JSON.stringify({ totalSize: 0, done: true, records: [] }),
         { status: 200, headers: { "content-type": "application/json" } },
       );
+    }
+
+    // Defensive composite-insert handler. With zero rows returned above
+    // this should never fire, but if a future code change issues an empty
+    // composite POST we'd rather the test fail on a boundary violation
+    // than on an unhandled 500.
+    if (/\/composite\/sobjects(\/|$)/.test(u)) {
+      return new Response(JSON.stringify([]), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
     }
 
     return new Response(`unhandled: ${u}`, { status: 500 });
@@ -312,6 +328,67 @@ describe("seed: AI-boundary enforcement across actions", () => {
     expect(start.step).toBe("started");
     expect(start.action).toBe("start");
     expect(start.nextAction).toBe("analyze");
+  });
+
+  it("run response contains no record data (counts + paths only)", async () => {
+    // `isolateIdMap: true` keeps the test from touching the user's
+    // persistent `~/.sandbox-seed/id-maps/` directory on merge-back.
+    const overrides = {
+      sessionRootDir: sessionRoot,
+      cacheRoot,
+      fetchFn: makeFetch(),
+      authBySource: fakeAuth("src", "00D000000000000AAA"),
+      authByTarget: fakeAuth("tgt", "00D000000000000BBB"),
+    };
+
+    const start = await seed(
+      {
+        action: "start",
+        sourceOrg: "src",
+        targetOrg: "tgt",
+        object: "Opportunity",
+        whereClause: "Amount > 100",
+        isolateIdMap: true,
+      },
+      overrides,
+    );
+    await seed({ action: "analyze", sessionId: start.sessionId }, overrides);
+    await seed(
+      {
+        action: "select",
+        sessionId: start.sessionId,
+        includeOptionalParents: [],
+        includeOptionalChildren: [],
+      },
+      overrides,
+    );
+    await seed({ action: "dry_run", sessionId: start.sessionId }, overrides);
+
+    const run = await seed(
+      { action: "run", sessionId: start.sessionId, confirm: true },
+      overrides,
+    );
+
+    expect(findBoundaryViolations(run)).toEqual([]);
+    expect(run.action).toBe("run");
+    expect(run.step).toBe("executed");
+    expect(run.nextAction).toBeNull();
+
+    const s = run.summary as Record<string, unknown>;
+    expect(typeof s.totalInserted).toBe("number");
+    expect(typeof s.errorCount).toBe("number");
+    // Integer-map shape: insertedCounts values are all numbers, never records.
+    const counts = s.insertedCounts as Record<string, unknown>;
+    expect(typeof counts).toBe("object");
+    for (const v of Object.values(counts)) {
+      expect(typeof v).toBe("number");
+    }
+    // Paths are file paths under the test session dir — never record IDs.
+    expect(typeof s.logPath).toBe("string");
+    expect(typeof s.idMapPath).toBe("string");
+    expect((s.logPath as string).startsWith(sessionRoot)).toBe(true);
+    expect((s.idMapPath as string).startsWith(sessionRoot)).toBe(true);
+    expect(s.isolateIdMap).toBe(true);
   });
 
   it("rejects production target (IsSandbox=false)", async () => {
