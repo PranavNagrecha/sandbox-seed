@@ -1,5 +1,6 @@
 import type { OrgAuth } from "../auth/sf-auth.ts";
 import { ApiError } from "../errors.ts";
+import { salesforceFetch } from "../salesforce-fetch.ts";
 
 /**
  * Tooling API client, scoped to exactly what the validation-rule
@@ -82,7 +83,7 @@ export async function queryActiveValidationRules(opts: {
     `/tooling/query?q=${encodeURIComponent(soql)}`;
 
   while (pageUrl !== null) {
-    const res: Response = await fetchFn(pageUrl, {
+    const res: Response = await salesforceFetch(fetchFn, pageUrl, {
       headers: {
         Authorization: `Bearer ${opts.auth.accessToken}`,
         Accept: "application/json",
@@ -129,7 +130,7 @@ export async function queryActiveValidationRules(opts: {
     const detailUrl =
       `${opts.auth.instanceUrl}/services/data/v${opts.auth.apiVersion}` +
       `/tooling/sobjects/ValidationRule/${encodeURIComponent(stub.id)}`;
-    const res = await fetchFn(detailUrl, {
+    const res = await salesforceFetch(fetchFn, detailUrl, {
       headers: {
         Authorization: `Bearer ${opts.auth.accessToken}`,
         Accept: "application/json",
@@ -187,7 +188,7 @@ export async function setValidationRuleActive(opts: {
   // Preserve every field from the snapshot, override only `active`.
   const metadata = { ...opts.rule.metadata, active: opts.active };
 
-  const res = await fetchFn(url, {
+  const res = await salesforceFetch(fetchFn, url, {
     method: "PATCH",
     headers: {
       Authorization: `Bearer ${opts.auth.accessToken}`,

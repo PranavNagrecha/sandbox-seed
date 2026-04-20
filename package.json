@@ -1,6 +1,6 @@
 {
   "name": "sandbox-seed",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Salesforce sandbox seeding CLI and MCP server — SOQL-driven org-to-org record copy with dependency-graph walking, cross-org FK remapping, and a hard AI-never-sees-your-data boundary.",
   "license": "Apache-2.0",
   "author": "Pranav Nagrecha",
@@ -51,10 +51,11 @@
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@oclif/core": "^4.0.0",
     "graphology": "^0.25.4",
+    "graphology-components": "^1.5.4",
     "graphology-dag": "^0.4.1",
     "graphology-traversal": "^0.3.1",
-    "graphology-components": "^1.5.4",
     "jsforce": "^3.1.0",
+    "yaml": "^2.8.3",
     "zod": "^3.25.0"
   },
   "devDependencies": {

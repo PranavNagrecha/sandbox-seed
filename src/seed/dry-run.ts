@@ -2,7 +2,10 @@ import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { OrgAuth } from "../auth/sf-auth.ts";
 import type { DescribeClient } from "../describe/client.ts";
+import type { Field, SObjectDescribe } from "../describe/types.ts";
+import { isReference } from "../describe/types.ts";
 import type { DependencyGraph } from "../graph/build.ts";
+import type { LoadPlan } from "../graph/order.ts";
 import { UserError } from "../errors.ts";
 import {
   chunkIds,
@@ -11,8 +14,17 @@ import {
   soqlIdList,
   type ScopePath,
 } from "./extract.ts";
+import {
+  buildCanonicalPlan,
+  canonicalStringify,
+  hashCanonicalPlan,
+} from "./plan-hash.ts";
+import { ProjectIdMap, type TargetIdentity } from "./project-id-map.ts";
 import type { DryRunSummary, UpsertDecisionSummary } from "./session.ts";
 import { resolveUpsertKey } from "./upsert-key.ts";
+import { salesforceFetch } from "../salesforce-fetch.ts";
+
+const DEFAULTED_OWNER_TARGETS = new Set(["User", "Group", "Queue"]);
 
 /**
  * Dry-run: for each object in the final load order, determine how many
@@ -36,10 +48,28 @@ export type DryRunOptions = {
   rootObject: string;
   whereClause: string;
   finalObjectList: string[];
+  /**
+   * Restricted load order — same object the run will execute against.
+   * Required: the plan hash is computed over this shape, so the caller
+   * MUST pass the same load plan it will feed to `runExecute` (otherwise
+   * the run-time hash check fires a false positive).
+   */
+  loadPlan: LoadPlan;
   sessionDir: string;
   fetchFn?: typeof fetch;
   /** See src/seed/extract.ts ScopePath kind="child-lookup". */
   childLookups?: Record<string, string[]>;
+  /**
+   * When provided (and `isolateIdMap` is not set), dry-run consults the
+   * persistent project-level id-map so "already seeded on prior run"
+   * counts appear in the summary. Pure read-only — the map is never
+   * written from dry-run.
+   */
+  sourceAlias?: string;
+  /** See `sourceAlias`. */
+  targetAliasForIdMap?: string;
+  targetIdentity?: TargetIdentity;
+  isolateIdMap?: boolean;
 };
 
 export async function runDryRun(opts: DryRunOptions): Promise<DryRunSummary> {
@@ -79,6 +109,38 @@ export async function runDryRun(opts: DryRunOptions): Promise<DryRunSummary> {
   const materializedIds = new Map<string, string[]>();
   materializedIds.set(opts.rootObject, rootIds);
 
+  // Optional: load the persistent project-level map so the dry-run can
+  // predict how many in-scope source rows the run will skip as
+  // already-seeded. Read-only — never written from dry-run.
+  let projectEntries: Record<string, string> = {};
+  let projectIdMapPath: string | undefined;
+  let projectIdMapInvalidated: DryRunSummary["projectIdMapInvalidated"];
+  if (
+    opts.isolateIdMap !== true &&
+    typeof opts.sourceAlias === "string" &&
+    opts.sourceAlias.length > 0 &&
+    opts.targetIdentity !== undefined
+  ) {
+    const targetAlias = opts.targetAliasForIdMap;
+    if (typeof targetAlias === "string" && targetAlias.length > 0) {
+      const pm = new ProjectIdMap({
+        sourceAlias: opts.sourceAlias,
+        targetAlias,
+      });
+      projectIdMapPath = pm.paths().mapPath;
+      // Dry-run treats invalidation as a non-destructive observation.
+      // We still archive (matching `load()` semantics) and surface the
+      // reason; the resulting empty map means zero predicted skips.
+      const loaded = await pm.load(opts.targetIdentity);
+      projectEntries = loaded.entries;
+      if (loaded.invalidated !== null) {
+        projectIdMapInvalidated = loaded.invalidated;
+      }
+    }
+  }
+
+  const alreadySeededCounts: Record<string, number> = {};
+  const haveProjectMap = Object.keys(projectEntries).length > 0;
   for (const [object, paths] of pathsByObject) {
     const unionedIds = new Set<string>();
     const soqlPieces: string[] = [];
@@ -104,6 +166,13 @@ export async function runDryRun(opts: DryRunOptions): Promise<DryRunSummary> {
     // on this object later (rare but possible).
     if (unionedIds.size > 0) {
       materializedIds.set(object, [...unionedIds]);
+    }
+    if (haveProjectMap && unionedIds.size > 0) {
+      let hits = 0;
+      for (const srcId of unionedIds) {
+        if (projectEntries[`${object}:${srcId}`] !== undefined) hits++;
+      }
+      if (hits > 0) alreadySeededCounts[object] = hits;
     }
   }
 
@@ -148,9 +217,44 @@ export async function runDryRun(opts: DryRunOptions): Promise<DryRunSummary> {
     }
   }
 
+  // Estimate User/Group/Queue FKs that will be defaulted at run time.
+  // These standard-roots are NOT remapped (only RecordType is); any row
+  // with a populated reference gets its field omitted during rewrite so
+  // Salesforce's default (running user) takes over. Count here so the
+  // user sees the impact before running.
+  const defaultedByObject = await countDefaultedOwnerRefs({
+    objects: opts.finalObjectList,
+    sourceAuth: opts.sourceAuth,
+    sourceDescribe: opts.sourceDescribe,
+    perObjectSoql,
+    fetchFn: opts.fetchFn,
+  });
+  const totalDefaultedOwnerRefs = Object.values(defaultedByObject).reduce(
+    (a, b) => a + b,
+    0,
+  );
+
   const totalRecords = Object.values(perObjectCounts).reduce((a, b) => a + b, 0);
   const completedAt = new Date().toISOString();
   const reportPath = join(opts.sessionDir, "dry-run.md");
+
+  const sourceAliasForHash = opts.sourceAuth.alias ?? opts.sourceAuth.username;
+  const targetAliasForHash = opts.targetAuth.alias ?? opts.targetAuth.username;
+
+  // Canonical plan + hash. Written to disk as plan.json; hex digest stored
+  // on the session so `run` can recompute and refuse on drift.
+  const canonicalPlan = buildCanonicalPlan({
+    rootObject: opts.rootObject,
+    whereClause: opts.whereClause,
+    sourceAlias: sourceAliasForHash,
+    targetAlias: targetAliasForHash,
+    finalObjectList: opts.finalObjectList,
+    loadPlan: opts.loadPlan,
+    upsertDecisions,
+  });
+  const planHash = hashCanonicalPlan(canonicalPlan);
+  const planPath = join(opts.sessionDir, "plan.json");
+  await writeFile(planPath, canonicalStringify(canonicalPlan), "utf8");
 
   await writeFile(
     reportPath,
@@ -165,8 +269,11 @@ export async function runDryRun(opts: DryRunOptions): Promise<DryRunSummary> {
       schemaIssues,
       upsertDecisions,
       completedAt,
-      sourceAlias: opts.sourceAuth.alias ?? opts.sourceAuth.username,
-      targetAlias: opts.targetAuth.alias ?? opts.targetAuth.username,
+      sourceAlias: sourceAliasForHash,
+      targetAlias: targetAliasForHash,
+      planHash,
+      defaultedOwnerRefByObject: defaultedByObject,
+      totalDefaultedOwnerRefs,
     }),
     "utf8",
   );
@@ -178,7 +285,99 @@ export async function runDryRun(opts: DryRunOptions): Promise<DryRunSummary> {
     completedAt,
     targetSchemaIssues: schemaIssues,
     upsertDecisions,
+    alreadySeededCounts:
+      Object.keys(alreadySeededCounts).length > 0 ? alreadySeededCounts : undefined,
+    projectIdMapPath,
+    projectIdMapInvalidated,
+    planHash,
+    planPath,
+    defaultedOwnerRefCount: totalDefaultedOwnerRefs,
+    defaultedOwnerRefByObject:
+      Object.keys(defaultedByObject).length > 0 ? defaultedByObject : undefined,
   };
+}
+
+/**
+ * For each object, query the source for rows where any User/Group/Queue
+ * reference field is populated. Those references will NOT be remapped at
+ * run time (only RecordType is remapped), so the run silently defaults
+ * them to the running user. This preview lets users see the blast radius
+ * before executing.
+ *
+ * Best-effort: skips objects whose describe or count query fails, and
+ * returns a partial map. A missing entry means "couldn't measure", not
+ * "no references."
+ */
+async function countDefaultedOwnerRefs(args: {
+  objects: string[];
+  sourceAuth: OrgAuth;
+  sourceDescribe: DescribeClient;
+  perObjectSoql: Record<string, string>;
+  fetchFn?: typeof fetch;
+}): Promise<Record<string, number>> {
+  const out: Record<string, number> = {};
+  for (const object of args.objects) {
+    let desc: SObjectDescribe;
+    try {
+      desc = await args.sourceDescribe.describeObject(object);
+    } catch {
+      continue;
+    }
+    const ownerFields: Field[] = [];
+    for (const f of desc.fields) {
+      if (!isReference(f)) continue;
+      if (f.createable === false) continue;
+      const targets = f.referenceTo;
+      if (targets.some((t) => DEFAULTED_OWNER_TARGETS.has(t))) {
+        ownerFields.push(f);
+      }
+    }
+    if (ownerFields.length === 0) continue;
+
+    // Reuse the first per-object scope SOQL line to pin the same WHERE as
+    // dry-run's count, then add the owner-FK populated filter. Skip the
+    // object if the stored SOQL is a comment (transitive/unknown path) or
+    // doesn't have a WHERE to extend.
+    const scopeSoql = args.perObjectSoql[object];
+    if (scopeSoql === undefined || scopeSoql.length === 0) continue;
+    const firstPath = scopeSoql.split("\n\n")[0] ?? "";
+    const soqlLine = firstPath.split("\n").find((l) => l.toUpperCase().startsWith("SELECT"));
+    if (soqlLine === undefined) continue;
+    const whereIx = soqlLine.toUpperCase().indexOf(" WHERE ");
+    if (whereIx === -1) continue;
+    const whereBody = soqlLine.slice(whereIx + 7);
+    const filters = ownerFields.map((f) => `${f.name} != null`).join(" OR ");
+    const countSoql = `SELECT COUNT() FROM ${object} WHERE (${whereBody}) AND (${filters})`;
+    try {
+      const n = await countQuery({
+        auth: args.sourceAuth,
+        soql: countSoql,
+        fetchFn: args.fetchFn,
+      });
+      if (n > 0) out[object] = n;
+    } catch {
+      // Best-effort preview — never fails the dry-run.
+    }
+  }
+  return out;
+}
+
+async function countQuery(opts: {
+  auth: OrgAuth;
+  soql: string;
+  fetchFn?: typeof fetch;
+}): Promise<number> {
+  const url = `${opts.auth.instanceUrl}/services/data/v${opts.auth.apiVersion}/query?q=${encodeURIComponent(opts.soql)}`;
+  const fetchFn = opts.fetchFn ?? fetch;
+  const res = await salesforceFetch(fetchFn, url, {
+    headers: {
+      Authorization: `Bearer ${opts.auth.accessToken}`,
+      Accept: "application/json",
+    },
+  });
+  if (!res.ok) throw new Error(`count query failed: HTTP ${res.status}`);
+  const body = (await res.json()) as { totalSize?: number };
+  return typeof body.totalSize === "number" ? body.totalSize : 0;
 }
 
 async function idsForPath(opts: {
@@ -270,6 +469,9 @@ function renderReport(args: {
   completedAt: string;
   sourceAlias: string;
   targetAlias: string;
+  planHash: string;
+  defaultedOwnerRefByObject: Record<string, number>;
+  totalDefaultedOwnerRefs: number;
 }): string {
   const lines: string[] = [];
   lines.push(`# Sandbox-seed dry run`);
@@ -362,11 +564,41 @@ function renderReport(args: {
     );
   }
   lines.push(``);
+  lines.push(`## User / Group / Queue references (will be defaulted)`);
+  lines.push(``);
+  if (args.totalDefaultedOwnerRefs === 0) {
+    lines.push(
+      `No in-scope records reference User, Group, or Queue objects. Ownership ` +
+        `will match whatever Salesforce assigns by default on insert.`,
+    );
+  } else {
+    lines.push(
+      `Sandbox-seed does **not** remap User / Group / Queue references across orgs. ` +
+        `Any row with a populated \`OwnerId\`, \`CreatedById\`, or similar User / Group / ` +
+        `Queue lookup will be inserted with the field omitted — Salesforce applies the ` +
+        `running user's default. If preserving ownership matters, this version doesn't ` +
+        `give it to you.`,
+    );
+    lines.push(``);
+    lines.push(`| Object | Rows with User/Group/Queue refs populated |`);
+    lines.push(`| --- | --- |`);
+    for (const obj of args.finalObjectList) {
+      const n = args.defaultedOwnerRefByObject[obj] ?? 0;
+      if (n > 0) lines.push(`| \`${obj}\` | ${n} |`);
+    }
+    lines.push(``);
+    lines.push(`**Total defaulted references: ${args.totalDefaultedOwnerRefs}**`);
+  }
+  lines.push(``);
   lines.push(`---`);
+  lines.push(``);
+  lines.push(`Plan hash: \`${args.planHash}\``);
   lines.push(``);
   lines.push(
     `To execute the full seed, call seed with ` +
-      `\`{action: "run", sessionId: "<this-session>", confirm: true}\` within 24 hours.`,
+      `\`{action: "run", sessionId: "<this-session>", confirm: true}\` within 24 hours. ` +
+      `The run will recompute this hash from the live graph + describes; a mismatch ` +
+      `means the plan drifted since dry-run and the run is refused until you re-dry-run.`,
   );
 
   return lines.join("\n");

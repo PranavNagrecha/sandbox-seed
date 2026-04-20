@@ -1,5 +1,6 @@
 import type { OrgAuth } from "../auth/sf-auth.ts";
 import { ApiError } from "../errors.ts";
+import { salesforceFetch } from "../salesforce-fetch.ts";
 
 /**
  * Opt-in row count fetch. Runs `SELECT COUNT() FROM <Object>` per object.
@@ -28,7 +29,7 @@ export async function fetchRowCounts(opts: FetchCountsOptions): Promise<Map<stri
 
     let res: Response;
     try {
-      res = await fetchFn(url, {
+      res = await salesforceFetch(fetchFn, url, {
         headers: {
           Authorization: `Bearer ${opts.auth.accessToken}`,
           Accept: "application/json",

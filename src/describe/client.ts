@@ -1,5 +1,6 @@
 import type { OrgAuth } from "../auth/sf-auth.ts";
 import { ApiError, UserError } from "../errors.ts";
+import { salesforceFetch } from "../salesforce-fetch.ts";
 import type { DescribeCache } from "./cache.ts";
 import type { GlobalDescribe, SObjectDescribe } from "./types.ts";
 
@@ -62,7 +63,7 @@ export class DescribeClient {
   }
 
   private async get<T>(url: string): Promise<T> {
-    const res = await this.fetchFn(url, {
+    const res = await salesforceFetch(this.fetchFn, url, {
       headers: {
         Authorization: `Bearer ${this.auth.accessToken}`,
         Accept: "application/json",

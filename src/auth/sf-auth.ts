@@ -149,7 +149,7 @@ async function tryResolveViaAuthFile(alias: string, apiVersion: string): Promise
     return null;
   }
 
-  if (looksEncrypted(accessToken)) {
+  if (!looksPlaintext(accessToken)) {
     throw new AuthError(
       `Access token for "${alias}" appears encrypted. Phase 1 requires the \`sf\` CLI for encrypted auth files.`,
       "Install the `sf` CLI (https://developer.salesforce.com/tools/salesforcecli) and retry.",
@@ -198,6 +198,22 @@ async function readDefaultTargetOrg(): Promise<string | undefined> {
   return undefined;
 }
 
-function looksEncrypted(token: string): boolean {
-  return !token.startsWith("00D") && !token.includes("!");
+/**
+ * Sanity-check that `token` looks like a Salesforce plaintext OAuth access
+ * token. Two positive signals (either is sufficient):
+ *   - Starts with `00D` — the Org ID prefix carried at the head of the token.
+ *   - Contains `!` — tokens are formatted as `<OrgId>!<rest>`.
+ *
+ * Encrypted tokens pulled from `~/.sf/` on systems where the OS keychain
+ * holds the key look like opaque base64 — no `00D` prefix, no `!`. Returning
+ * `false` here tells the caller "don't try to use this; shell out to `sf`."
+ *
+ * Naming: inverted semantics on purpose. The prior `looksEncrypted` forced
+ * call sites to read a negative ("is NOT encrypted"), which made the
+ * `!token.startsWith(...) && !token.includes(...)` body a double-negative to
+ * reason about. `looksPlaintext` is a positive predicate: true means "use
+ * this token directly."
+ */
+function looksPlaintext(token: string): boolean {
+  return token.startsWith("00D") || token.includes("!");
 }

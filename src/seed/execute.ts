@@ -8,6 +8,7 @@ import type { DependencyGraph } from "../graph/build.ts";
 import { isStandardRootObject } from "../graph/standard-objects.ts";
 import type { LoadPlan, LoadStep } from "../graph/order.ts";
 import { ApiError, UserError } from "../errors.ts";
+import { salesforceFetch } from "../salesforce-fetch.ts";
 import {
   chunkIds,
   computeScopePaths,
@@ -17,6 +18,7 @@ import {
   type ScopePath,
 } from "./extract.ts";
 import { IdMap } from "./id-map.ts";
+import { ProjectIdMap, type TargetIdentity } from "./project-id-map.ts";
 import type { ExecuteSummary, UpsertDecisionSummary } from "./session.ts";
 import {
   reactivateFromSnapshot,
@@ -85,6 +87,25 @@ export type ExecuteOptions = {
    * See src/seed/extract.ts ScopePath kind="child-lookup".
    */
   childLookups?: Record<string, string[]>;
+  /**
+   * Source/target sf aliases. When both are set (and `isolateIdMap` is not
+   * true), the run reads the persistent project-level id-map at
+   * `~/.sandbox-seed/id-maps/<source>__<target>.json` so prior runs'
+   * source→target mappings are reused (cross-run FK stitching) and
+   * already-seeded source rows are skipped on INSERT. New mappings from
+   * this run are merged back at the end.
+   */
+  sourceAlias?: string;
+  /** See `sourceAlias`. Falls back to `targetOrgAlias` when only one is provided. */
+  targetAliasForIdMap?: string;
+  /** Target org identity for project-id-map invalidation (orgId + LastRefreshDate). */
+  targetIdentity?: TargetIdentity;
+  /**
+   * Opt out of the persistent project-level id-map for this run. Useful
+   * when a user wants a clean slate against a target. The session-local
+   * id-map.json is still written either way.
+   */
+  isolateIdMap?: boolean;
 };
 
 const BATCH_SIZE = 200;
@@ -98,6 +119,49 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteSummary> 
   await writeFile(logPath, "", "utf8");
   const idMap = new IdMap(idMapPath);
   await idMap.load();
+
+  // Layer the persistent project-level map UNDER the session-local one,
+  // so prior runs' source→target mappings are reused (cross-run FK
+  // stitching) and re-seeded source rows are skipped on insert. The
+  // session map then accumulates new mappings during this run, and we
+  // merge them back into the project map in the finally block.
+  let projectMap: ProjectIdMap | null = null;
+  let projectIdMapPath: string | undefined;
+  let projectIdMapInvalidated: ExecuteSummary["projectIdMapInvalidated"];
+  const alreadySeededCounts: Record<string, number> = {};
+  let projectMapSizeBefore = 0;
+  if (
+    opts.isolateIdMap !== true &&
+    typeof opts.sourceAlias === "string" &&
+    opts.sourceAlias.length > 0 &&
+    opts.targetIdentity !== undefined
+  ) {
+    const targetAlias = opts.targetAliasForIdMap ?? opts.targetOrgAlias;
+    if (typeof targetAlias === "string" && targetAlias.length > 0) {
+      projectMap = new ProjectIdMap({
+        sourceAlias: opts.sourceAlias,
+        targetAlias,
+      });
+      projectIdMapPath = projectMap.paths().mapPath;
+      const loaded = await projectMap.load(opts.targetIdentity);
+      if (loaded.invalidated !== null) {
+        projectIdMapInvalidated = loaded.invalidated;
+        await appendFile(
+          logPath,
+          `[${new Date().toISOString()}] Project id-map invalidated (${loaded.invalidated.reason}); archived to ${loaded.invalidated.archivedTo}. Starting fresh.\n`,
+          "utf8",
+        );
+      }
+      projectMapSizeBefore = Object.keys(loaded.entries).length;
+      for (const [k, v] of Object.entries(loaded.entries)) {
+        const ix = k.indexOf(":");
+        if (ix <= 0) continue;
+        const obj = k.slice(0, ix);
+        const srcId = k.slice(ix + 1);
+        idMap.set(obj, srcId, v);
+      }
+    }
+  }
 
   // An object may have multiple paths (e.g. both direct-parent and
   // child-lookup resolve to different ID sets). Group by object; the
@@ -190,6 +254,10 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteSummary> 
         });
         insertedCounts[object] = res.inserted;
         errorCount += res.errors;
+        if (res.alreadySeeded > 0) {
+          alreadySeededCounts[object] =
+            (alreadySeededCounts[object] ?? 0) + res.alreadySeeded;
+        }
       } else if (step.kind === "cycle") {
         await appendLog(
           `CYCLE step with ${step.objects.length} object(s): ${step.objects.join(", ")}. ` +
@@ -242,6 +310,28 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteSummary> 
     }
   }
 
+  let projectMapSizeAfter = projectMapSizeBefore;
+  if (projectMap !== null && opts.targetIdentity !== undefined) {
+    // Snapshot the session id-map back into the project map. Last-write-
+    // wins on collisions (per BACKLOG / plan §3) — the freshest target id
+    // for a given source row is the authoritative one. Best-effort: if
+    // the project write fails (disk full, permission flip), the session
+    // map still has the truth and the next run will re-attempt.
+    const snapshot: Record<string, string> = {};
+    for (const [k, v] of idMap.entries()) snapshot[k] = v;
+    try {
+      const merged = await projectMap.merge(snapshot, opts.targetIdentity);
+      projectMapSizeAfter = merged.sizeAfter;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      await appendFile(
+        logPath,
+        `[${new Date().toISOString()}] Project id-map merge-back failed: ${msg}. Session id-map.json still has the authoritative entries.\n`,
+        "utf8",
+      );
+    }
+  }
+
   return {
     logPath,
     idMapPath,
@@ -250,6 +340,14 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteSummary> 
     errorCount,
     validationRulesTouched: vrTouchedCount,
     validationRulesReactivationFailed: vrReactivationFailed,
+    projectIdMapPath,
+    alreadySeededCounts:
+      Object.keys(alreadySeededCounts).length > 0 ? alreadySeededCounts : undefined,
+    projectIdMapInvalidated,
+    projectIdMapSize:
+      projectMap !== null
+        ? { before: projectMapSizeBefore, after: projectMapSizeAfter }
+        : undefined,
   };
 }
 
@@ -261,7 +359,7 @@ async function seedSingle(args: {
   idMap: IdMap;
   rootIds: string[];
   appendLog: (msg: string) => Promise<void>;
-}): Promise<{ inserted: number; errors: number }> {
+}): Promise<{ inserted: number; errors: number; alreadySeeded: number }> {
   const { object, scopes, opts, fetchFn, idMap, rootIds, appendLog } = args;
 
   const srcDescribe = await opts.sourceDescribe.describeObject(object);
@@ -281,7 +379,7 @@ async function seedSingle(args: {
   }
   if (createable.length === 0) {
     await appendLog(`SKIP ${object}: no createable fields after target intersection.`);
-    return { inserted: 0, errors: 0 };
+    return { inserted: 0, errors: 0, alreadySeeded: 0 };
   }
 
   // Union records across every applicable path, deduping by Id.
@@ -315,7 +413,7 @@ async function seedSingle(args: {
   const records = [...byId.values()];
   if (records.length === 0) {
     await appendLog(`SKIP ${object}: no records returned by any scope path.`);
-    return { inserted: 0, errors: 0 };
+    return { inserted: 0, errors: 0, alreadySeeded: 0 };
   }
   await appendLog(`${object}: total unique source record(s) across paths: ${records.length}.`);
 
@@ -339,6 +437,7 @@ async function seedSingle(args: {
 
   let inserted = 0;
   let errors = 0;
+  let alreadySeeded = 0;
   for (const chunk of chunkIds(records, BATCH_SIZE)) {
     // Split rewrites into an UPSERT bucket (ext-id populated) and an
     // INSERT bucket (no ext-id value, or no picked key). We dispatch
@@ -347,11 +446,21 @@ async function seedSingle(args: {
     // target Id whether `created` is true or false.
     const upsertRewrites: Array<{ body: Record<string, unknown>; sourceId: string }> = [];
     const insertRewrites: Array<{ body: Record<string, unknown>; sourceId: string }> = [];
+    let alreadySeededInChunk = 0;
     for (const rec of chunk) {
-      const rewritten = rewriteRecordForTarget(object, rec, createable, idMap);
-      if (rewritten === null) continue;
       const srcId = (rec as Record<string, unknown>).Id;
       const sourceId = typeof srcId === "string" ? srcId : "";
+      // Cross-run dedup: if the project id-map was layered in and already
+      // has a target id for this source row, skip the INSERT entirely. We
+      // still let the UPSERT path through — if an external-id key was
+      // picked the user explicitly wants Salesforce to match-and-update.
+      if (upsertField === null && sourceId.length > 0 && idMap.has(object, sourceId)) {
+        alreadySeeded++;
+        alreadySeededInChunk++;
+        continue;
+      }
+      const rewritten = rewriteRecordForTarget(object, rec, createable, idMap);
+      if (rewritten === null) continue;
 
       if (upsertField !== null) {
         const v = rewritten[upsertField];
@@ -363,7 +472,8 @@ async function seedSingle(args: {
       insertRewrites.push({ body: rewritten, sourceId });
     }
 
-    const skipped = chunk.length - (upsertRewrites.length + insertRewrites.length);
+    const skipped =
+      chunk.length - (upsertRewrites.length + insertRewrites.length) - alreadySeededInChunk;
     if (skipped > 0) {
       errors += skipped;
       await appendLog(`${object}: skipped ${skipped} record(s) due to unresolved required FKs.`);
@@ -418,8 +528,15 @@ async function seedSingle(args: {
     }
   }
 
-  await appendLog(`${object}: inserted=${inserted} errors=${errors}`);
-  return { inserted, errors };
+  if (alreadySeeded > 0) {
+    await appendLog(
+      `${object}: skipped ${alreadySeeded} record(s) already present in project id-map (cross-run dedup).`,
+    );
+  }
+  await appendLog(
+    `${object}: inserted=${inserted} errors=${errors} alreadySeeded=${alreadySeeded}`,
+  );
+  return { inserted, errors, alreadySeeded };
 }
 
 async function seedCycle(args: {
@@ -543,20 +660,56 @@ async function seedCycle(args: {
 
   // Phase 2: for each source record of `breakSource` with a non-null break-edge
   // value, PATCH the target record to set the break-edge field to the mapped ID.
+  //
+  // Two reasons a row with a non-null break-edge value can be skipped, and we
+  // log them separately because they mean very different things to the user:
+  //
+  //   (a) unresolvedTarget — the row across the break edge wasn't seeded.
+  //       The source row pointed at a parent (or sibling) that's out of scope
+  //       for this seed; nothing we can do without pulling more into scope.
+  //
+  //   (b) unresolvedSelf — phase 1 failed to insert this row itself. The
+  //       row is already counted in the phase-1 error tally; we just can't
+  //       back-fill something that doesn't exist.
+  //
+  // Conflating these under one "skipped" bucket made phase-2 diagnostics
+  // noisy: users couldn't tell "I need to widen scope" from "an earlier
+  // insert failed — see above."
   const sourceSideRecords = recordsBySourceId.get(breakSource);
   if (sourceSideRecords !== undefined) {
     const updates: Array<{ sourceId: string; targetId: string; fkTargetId: string }> = [];
+    let unresolvedTarget = 0;
+    let unresolvedSelf = 0;
     for (const [sourceId, rec] of sourceSideRecords) {
       const val = (rec as Record<string, unknown>)[breakField];
       if (typeof val !== "string" || val.length === 0) continue;
       const mappedTarget = idMap.get(step.breakEdge.target, val);
       const mappedSelf = idMap.get(breakSource, sourceId);
-      if (mappedTarget === undefined || mappedSelf === undefined) continue;
+      if (mappedTarget === undefined) {
+        unresolvedTarget++;
+        continue;
+      }
+      if (mappedSelf === undefined) {
+        unresolvedSelf++;
+        continue;
+      }
       updates.push({ sourceId, targetId: mappedSelf, fkTargetId: mappedTarget });
     }
     await appendLog(
       `${breakSource} [cycle phase 2]: ${updates.length} record(s) to backfill ${breakField}.`,
     );
+    if (unresolvedTarget > 0) {
+      await appendLog(
+        `${breakSource} [cycle phase 2]: ${unresolvedTarget} record(s) left with null ${breakField} — ` +
+          `target row on ${step.breakEdge.target} was not seeded (out of scope).`,
+      );
+    }
+    if (unresolvedSelf > 0) {
+      await appendLog(
+        `${breakSource} [cycle phase 2]: ${unresolvedSelf} record(s) left with null ${breakField} — ` +
+          `phase-1 insert of ${breakSource} failed for these rows (see earlier errors).`,
+      );
+    }
     for (const u of updates) {
       try {
         await patchRecord({
@@ -891,7 +1044,7 @@ async function compositeUpsert(args: {
   const url =
     `${args.auth.instanceUrl}/services/data/v${args.auth.apiVersion}` +
     `/composite/sobjects/${encodeURIComponent(args.object)}/${encodeURIComponent(args.externalIdField)}`;
-  const res = await args.fetchFn(url, {
+  const res = await salesforceFetch(args.fetchFn, url, {
     method: "PATCH",
     headers: {
       Authorization: `Bearer ${args.auth.accessToken}`,
@@ -926,7 +1079,7 @@ async function compositeInsert(args: {
   fetchFn: typeof fetch;
 }): Promise<CompositeResult[]> {
   const url = `${args.auth.instanceUrl}/services/data/v${args.auth.apiVersion}/composite/sobjects`;
-  const res = await args.fetchFn(url, {
+  const res = await salesforceFetch(args.fetchFn, url, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${args.auth.accessToken}`,
@@ -960,7 +1113,7 @@ async function patchRecord(args: {
   fetchFn: typeof fetch;
 }): Promise<void> {
   const url = `${args.auth.instanceUrl}/services/data/v${args.auth.apiVersion}/sobjects/${encodeURIComponent(args.object)}/${encodeURIComponent(args.targetId)}`;
-  const res = await args.fetchFn(url, {
+  const res = await salesforceFetch(args.fetchFn, url, {
     method: "PATCH",
     headers: {
       Authorization: `Bearer ${args.auth.accessToken}`,
