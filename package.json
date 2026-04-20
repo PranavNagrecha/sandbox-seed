@@ -1,7 +1,7 @@
 {
   "name": "sandbox-seed",
   "version": "0.1.0",
-  "description": "Salesforce sandbox seeding CLI and MCP server — SOQL-driven org-to-org migration, synthetic data generation, and deterministic masking. AI-safe by construction: record data never leaves your machine.",
+  "description": "Salesforce sandbox seeding CLI and MCP server — SOQL-driven org-to-org record copy with dependency-graph walking, cross-org FK remapping, and a hard AI-never-sees-your-data boundary.",
   "license": "Apache-2.0",
   "author": "Pranav Nagrecha",
   "homepage": "https://github.com/PranavNagrecha/sandbox-seed#readme",
