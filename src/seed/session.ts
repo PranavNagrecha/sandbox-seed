@@ -65,6 +65,37 @@ export type DryRunSummary = {
    * when describes succeed on both sides.
    */
   upsertDecisions?: Record<string, UpsertDecisionSummary>;
+  /**
+   * Predicted per-object count of source rows the run will skip because
+   * the persistent project-level id-map already has a target id for them.
+   * Only counts intersection of in-scope source rows with map entries for
+   * the same object. Absent when the project map was not consulted.
+   */
+  alreadySeededCounts?: Record<string, number>;
+  /** Path of the persistent project-level map, when consulted. */
+  projectIdMapPath?: string;
+  /** When the map was archived at load time (org swap / refresh). */
+  projectIdMapInvalidated?: {
+    reason: "org-refresh" | "org-mismatch" | "meta-corrupt";
+    archivedTo: string;
+  };
+  /**
+   * SHA-256 hex of the canonical plan ({root, whereClause, aliases, load
+   * order, upsert decisions}). `run` recomputes and refuses on mismatch —
+   * the plan you reviewed is the plan that runs. See `src/seed/plan-hash.ts`.
+   */
+  planHash?: string;
+  /** Absolute path to the canonical plan JSON written during dry-run. */
+  planPath?: string;
+  /**
+   * Count of records whose User/Group/Queue FKs will be defaulted to the
+   * running user on the target. Sum over finalObjectList of (in-scope source
+   * rows with a populated User/Group/Queue reference — except RecordType
+   * which IS remapped). Informational — does not block the run.
+   */
+  defaultedOwnerRefCount?: number;
+  /** Per-object breakdown of `defaultedOwnerRefCount`. */
+  defaultedOwnerRefByObject?: Record<string, number>;
 };
 
 export type ExecuteSummary = {
@@ -81,6 +112,22 @@ export type ExecuteSummary = {
   validationRulesTouched?: number;
   /** If reactivation had partial failures, the remaining fullNames. */
   validationRulesReactivationFailed?: string[];
+  /**
+   * Project-level id-map artefacts (persistent per-target-org map under
+   * `~/.sandbox-seed/id-maps/`). Only populated when the run consulted it
+   * (i.e. `isolateIdMap !== true` and source/target alias + identity were
+   * threaded in). Counts and paths only — never entries.
+   */
+  projectIdMapPath?: string;
+  /** Source rows skipped because the project map already had a target id. */
+  alreadySeededCounts?: Record<string, number>;
+  /** Set when the persisted map was archived (org swapped or refreshed). */
+  projectIdMapInvalidated?: {
+    reason: "org-refresh" | "org-mismatch" | "meta-corrupt";
+    archivedTo: string;
+  };
+  /** Map size before/after merge-back. */
+  projectIdMapSize?: { before: number; after: number };
 };
 
 export type Session = {
@@ -136,6 +183,13 @@ export type Session = {
    * to re-select what they already opted into at `start`.
    */
   childLookupTargets?: string[];
+  /**
+   * Opt out of the persistent project-level id-map for this session.
+   * See `src/seed/project-id-map.ts`. Default false — the project map is
+   * consulted on dry_run and merged back on run so successive sessions
+   * against the same target org stitch FKs automatically.
+   */
+  isolateIdMap?: boolean;
   /** If the user retries a step after an error, the last error is stored here. */
   lastError?: string;
 };

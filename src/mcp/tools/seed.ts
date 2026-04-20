@@ -9,6 +9,7 @@ import { runInspect } from "../../inspect/run.ts";
 import { classifyForSeed } from "../../seed/classify.ts";
 import { runDryRun } from "../../seed/dry-run.ts";
 import { runExecute } from "../../seed/execute.ts";
+import { buildCanonicalPlan, hashCanonicalPlan } from "../../seed/plan-hash.ts";
 import {
   queryCount,
   queryIds,
@@ -27,6 +28,7 @@ import {
 } from "../../seed/validation-rule-toggle.ts";
 import { queryActiveValidationRules } from "../../describe/tooling-client.ts";
 import { isReference } from "../../describe/types.ts";
+import { salesforceFetch } from "../../salesforce-fetch.ts";
 
 /**
  * The ONE MCP tool.
@@ -159,6 +161,17 @@ export const SeedArgs = z.object({
         "field names on that child. Example: { Contact: ['ReportsToId'] } when " +
         "root=Account seeds the referenced Contact records so ReportsToId resolves " +
         "instead of nulling. Per-run; the user selects which lookups each time.",
+    ),
+  isolateIdMap: z
+    .boolean()
+    .optional()
+    .describe(
+      "For action=start. When true, this session ignores the persistent " +
+        "project-level id-map at `~/.sandbox-seed/id-maps/<source>__<target>.json` — " +
+        "previously-seeded source rows will be re-inserted (not skipped) and " +
+        "cross-run FK stitching is disabled for this session only. Default " +
+        "false: the project map is consulted on dry_run (for already-seeded " +
+        "prediction) and merged back on run (for the next session's benefit).",
     ),
 });
 
@@ -389,6 +402,7 @@ async function doStart(
     scopeCount,
     disableValidationRulesOnRun: args.disableValidationRulesOnRun === true,
     childLookups: args.childLookups,
+    isolateIdMap: args.isolateIdMap === true,
   });
 
   return {
@@ -657,6 +671,15 @@ async function doDryRun(
     fetchFn: overrides.fetchFn,
   });
 
+  const dryRunPlan = computeLoadOrder(inspectResult.graph, {
+    requestedObjects: session.finalObjectList,
+  });
+
+  const targetIdentity = await getTargetIdentity({
+    auth: targetAuth,
+    fetchFn: overrides.fetchFn,
+  });
+
   const summary = await runDryRun({
     sourceAuth,
     targetAuth,
@@ -666,9 +689,14 @@ async function doDryRun(
     rootObject: session.rootObject,
     whereClause: session.whereClause,
     finalObjectList: session.finalObjectList,
+    loadPlan: dryRunPlan,
     sessionDir: store.sessionDir(session.id),
     fetchFn: overrides.fetchFn,
     childLookups: session.childLookups,
+    sourceAlias: session.sourceOrg,
+    targetAliasForIdMap: session.targetOrg,
+    targetIdentity,
+    isolateIdMap: session.isolateIdMap === true,
   });
 
   // If this session opted into deactivating target-org validation rules
@@ -735,9 +763,32 @@ async function doDryRun(
     upsertObjectCount: upsertCount,
     insertObjectCount: insertCount,
     upsertKeys,
+    planHash: summary.planHash,
+    planPath: summary.planPath,
   };
+  if (typeof summary.defaultedOwnerRefCount === "number" && summary.defaultedOwnerRefCount > 0) {
+    summaryOut.defaultedOwnerRefCount = summary.defaultedOwnerRefCount;
+    summaryOut.defaultedOwnerRefByObject = summary.defaultedOwnerRefByObject;
+  }
   if (vrPreview !== undefined) {
     summaryOut.validationRulesToDisable = vrPreview;
+  }
+  if (summary.alreadySeededCounts !== undefined) {
+    summaryOut.alreadySeededCounts = summary.alreadySeededCounts;
+    const totalAlready = Object.values(summary.alreadySeededCounts).reduce(
+      (a, b) => a + b,
+      0,
+    );
+    summaryOut.totalAlreadySeeded = totalAlready;
+  }
+  if (summary.projectIdMapPath !== undefined) {
+    summaryOut.projectIdMapPath = summary.projectIdMapPath;
+  }
+  if (summary.projectIdMapInvalidated !== undefined) {
+    summaryOut.projectIdMapInvalidated = summary.projectIdMapInvalidated;
+  }
+  if (session.isolateIdMap === true) {
+    summaryOut.isolateIdMap = true;
   }
 
   const schemaSuffix =
@@ -756,6 +807,11 @@ async function doDryRun(
         ? ` Validation-rule preview failed — run will still attempt the flip.`
         : ` ${vrPreview.count} target-org validation rule(s) will be deactivated + reactivated around the insert phase (exactly these, no others).`
       : "";
+  const ownerSuffix =
+    typeof summary.defaultedOwnerRefCount === "number" && summary.defaultedOwnerRefCount > 0
+      ? ` ${summary.defaultedOwnerRefCount} record(s) reference User / Group / Queue — ` +
+        `those references are NOT remapped and will default to the running user.`
+      : "";
 
   return {
     sessionId: session.id,
@@ -764,7 +820,7 @@ async function doDryRun(
     summary: summaryOut,
     nextAction: "run",
     guidance:
-      `Dry run complete. ${summary.totalRecords} record(s) total.${upsertSuffix}${schemaSuffix}${vrSuffix} ` +
+      `Dry run complete. ${summary.totalRecords} record(s) total.${upsertSuffix}${schemaSuffix}${vrSuffix}${ownerSuffix} ` +
       `Review ${summary.reportPath}. When the user confirms, call seed ` +
       `with action: "run", confirm: true.`,
   };
@@ -839,8 +895,38 @@ async function doRun(
     requestedObjects: session.finalObjectList,
   });
 
+  // Plan-hash gate: the canonical plan hash from dry-run must match what
+  // the live graph + upsert decisions produce now. Mismatch means the
+  // session drifted (graph changed, upsert key flipped, object set
+  // edited) — refuse until the user re-runs dry_run. The hash is over the
+  // same inputs dry-run wrote, so this is a deterministic check.
+  if (typeof session.dryRun?.planHash === "string") {
+    const nowPlan = buildCanonicalPlan({
+      rootObject: session.rootObject,
+      whereClause: session.whereClause,
+      sourceAlias: sourceAuth.alias ?? sourceAuth.username,
+      targetAlias: targetAuth.alias ?? targetAuth.username,
+      finalObjectList: session.finalObjectList,
+      loadPlan: restrictedPlan,
+      upsertDecisions: session.dryRun.upsertDecisions,
+    });
+    const nowHash = hashCanonicalPlan(nowPlan);
+    if (nowHash !== session.dryRun.planHash) {
+      throw new UserError(
+        `Plan hash mismatch — the load plan drifted since dry_run ` +
+          `(expected ${session.dryRun.planHash.slice(0, 12)}…, got ${nowHash.slice(0, 12)}…). ` +
+          `This means the source graph, upsert decisions, or object set has changed.`,
+        `Call seed with action: "dry_run" to produce a fresh plan, then retry run.`,
+      );
+    }
+  }
+
   let executed;
   try {
+    const targetIdentity = await getTargetIdentity({
+      auth: targetAuth,
+      fetchFn: overrides.fetchFn,
+    });
     executed = await runExecute({
       sourceAuth,
       targetAuth,
@@ -858,6 +944,10 @@ async function doRun(
       targetOrgAlias: session.targetOrg,
       upsertDecisions: session.dryRun?.upsertDecisions,
       childLookups: session.childLookups,
+      sourceAlias: session.sourceOrg,
+      targetAliasForIdMap: session.targetOrg,
+      targetIdentity,
+      isolateIdMap: session.isolateIdMap === true,
     });
   } catch (err) {
     session.lastError = err instanceof Error ? err.message : String(err);
@@ -886,6 +976,25 @@ async function doRun(
   if (executed.validationRulesReactivationFailed !== undefined) {
     summaryOut.validationRulesReactivationFailed =
       executed.validationRulesReactivationFailed;
+  }
+  if (executed.projectIdMapPath !== undefined) {
+    summaryOut.projectIdMapPath = executed.projectIdMapPath;
+  }
+  if (executed.alreadySeededCounts !== undefined) {
+    summaryOut.alreadySeededCounts = executed.alreadySeededCounts;
+    summaryOut.totalAlreadySeeded = Object.values(executed.alreadySeededCounts).reduce(
+      (a, b) => a + b,
+      0,
+    );
+  }
+  if (executed.projectIdMapInvalidated !== undefined) {
+    summaryOut.projectIdMapInvalidated = executed.projectIdMapInvalidated;
+  }
+  if (executed.projectIdMapSize !== undefined) {
+    summaryOut.projectIdMapSize = executed.projectIdMapSize;
+  }
+  if (session.isolateIdMap === true) {
+    summaryOut.isolateIdMap = true;
   }
 
   const vrSuffix =
@@ -1000,7 +1109,7 @@ async function checkIsSandbox(opts: {
   const fetchFn = opts.fetchFn ?? fetch;
   const soql = `SELECT IsSandbox FROM Organization LIMIT 1`;
   const url = `${opts.auth.instanceUrl}/services/data/v${opts.auth.apiVersion}/query?q=${encodeURIComponent(soql)}`;
-  const res = await fetchFn(url, {
+  const res = await salesforceFetch(fetchFn, url, {
     headers: {
       Authorization: `Bearer ${opts.auth.accessToken}`,
       Accept: "application/json",
@@ -1021,6 +1130,43 @@ async function checkIsSandbox(opts: {
   } catch {
     return false;
   }
+}
+
+/**
+ * Probe the target org for the identity bits the project-level id-map needs
+ * to detect "swapped to a different org" or "sandbox was refreshed". One
+ * SOQL hit; cheap. Cached upstream so the start step pays it once.
+ */
+export async function getTargetIdentity(opts: {
+  auth: OrgAuth;
+  fetchFn?: typeof fetch;
+}): Promise<{ orgId: string; lastRefreshDate: string | null }> {
+  const fetchFn = opts.fetchFn ?? fetch;
+  const soql = `SELECT Id, LastRefreshDate FROM Organization LIMIT 1`;
+  const url = `${opts.auth.instanceUrl}/services/data/v${opts.auth.apiVersion}/query?q=${encodeURIComponent(soql)}`;
+  const res = await salesforceFetch(fetchFn, url, {
+    headers: {
+      Authorization: `Bearer ${opts.auth.accessToken}`,
+      Accept: "application/json",
+    },
+  });
+  if (!res.ok) {
+    throw new ApiError(
+      `Could not read target Organization identity (HTTP ${res.status}).`,
+      `Check target-org permissions.`,
+    );
+  }
+  const body = (await res.json()) as {
+    records?: Array<{ Id?: string; LastRefreshDate?: string | null }>;
+  };
+  const rec = body.records?.[0];
+  if (!rec?.Id) {
+    throw new ApiError(
+      "Organization query returned no rows.",
+      "Re-authenticate the target org and retry.",
+    );
+  }
+  return { orgId: rec.Id, lastRefreshDate: rec.LastRefreshDate ?? null };
 }
 
 // Silence unused-import warnings for helpers consumed only inside dry-run /

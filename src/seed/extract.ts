@@ -1,6 +1,7 @@
 import type { OrgAuth } from "../auth/sf-auth.ts";
 import type { DependencyGraph, EdgeAttrs } from "../graph/build.ts";
 import { ApiError, UserError } from "../errors.ts";
+import { salesforceFetch } from "../salesforce-fetch.ts";
 
 /**
  * Low-level Salesforce REST calls used by `dry_run` and `run`.
@@ -301,7 +302,7 @@ async function doGet(
   url: string,
   fetchFn: typeof fetch,
 ): Promise<QueryEnvelope> {
-  const res = await fetchFn(url, {
+  const res = await salesforceFetch(fetchFn, url, {
     headers: {
       Authorization: `Bearer ${auth.accessToken}`,
       Accept: "application/json",

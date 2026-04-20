@@ -167,6 +167,34 @@ See [src/seed/validation-rule-toggle.ts](https://github.com/PranavNagrecha/sandb
 
 ---
 
+## Ownership / User / Group / Queue references
+
+References that target `User`, `Group`, or `Queue` (most commonly `OwnerId`, plus per-object fields like `AssignedToId` or `QueueId`) are deliberately **not walked** by the dependency graph builder. The reasoning:
+
+- These objects are **org-global**, not part of a seeded business process. Copying them cross-org conflates identity and data.
+- They are **frequently privileged** — a `User` row carries profile assignments, permission sets, and login state. Mirroring those into a sandbox is a security concern, not a data-seeding concern.
+- There is no **stable cross-org identity** for them. `User.Username` is unique per org but almost never matches across orgs (prod `alice@acme.com` vs sandbox `alice@acme.com.fulldev`). A reliable match would require configuration the tool cannot infer.
+
+At `run` time, FK fields pointing to these objects are serialized as `null` on insert. Salesforce then defaults them to the **target-org user performing the seed** — which is the authenticated user from the target alias. The side effects:
+
+- `OwnerId` everywhere resolves to the seeding user. Queue-owned cases, shared folders, etc. lose their original ownership.
+- `CreatedById` and `LastModifiedById` always resolve to the seeding user regardless — those fields aren't user-writable on insert.
+- Per-field owner-like lookups (e.g. a custom `Assigned_Engineer__c` targeting `User`) similarly default to the seeding user.
+
+The dry-run report surfaces a **"Defaulted owner/user/group references"** section with per-object counts so the user can see how many rows each object defaults before they run. The count comes from re-issuing the per-object scope SOQL with an `<ownerField> != null OR …` predicate — same scope, aggregated over the defaulted reference fields.
+
+If this behavior is unacceptable for a given seed, the current workaround is:
+
+1. Seed first with defaulting.
+2. Manually build a source-user → target-user mapping (CSV or script).
+3. Bulk-update ownership on the target org after the seed completes.
+
+A first-class "User id-map" option is on the roadmap. It is deliberately not part of 0.2.0 because the right design — match by username? explicit mapping file? opt-in per field? — needs more real-world usage data.
+
+See [src/seed/dry-run.ts](https://github.com/PranavNagrecha/sandbox-seed/blob/main/src/seed/dry-run.ts) (`countDefaultedOwnerRefs`) and [src/graph/standard-objects.ts](https://github.com/PranavNagrecha/sandbox-seed/blob/main/src/graph/standard-objects.ts).
+
+---
+
 ## Test layout
 
 | Directory | Scope |

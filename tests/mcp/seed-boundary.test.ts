@@ -107,6 +107,24 @@ function makeFetch(): typeof fetch {
       );
     }
 
+    if (/LastRefreshDate\s+FROM\s+Organization/i.test(decoded)) {
+      // Project-id-map identity probe — source is prod (null refresh),
+      // target is sandbox (recently refreshed).
+      return new Response(
+        JSON.stringify({
+          records: [
+            {
+              Id: isTarget ? "00D000000000000BBB" : "00D000000000000AAA",
+              LastRefreshDate: isTarget ? "2026-04-01T00:00:00.000Z" : null,
+            },
+          ],
+          done: true,
+          totalSize: 1,
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }
+
     if (/^SELECT\s+COUNT\(\)/i.test(decoded.replace(/^.*\bq=/, ""))) {
       return new Response(
         JSON.stringify({ totalSize: sourceOpptyIds.length, done: true, records: [] }),

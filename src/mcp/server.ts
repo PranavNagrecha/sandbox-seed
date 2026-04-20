@@ -1,5 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SeedError } from "../errors.ts";
+import { playbook, PlaybookArgs } from "./tools/playbook.ts";
 import { seed, SeedArgs } from "./tools/seed.ts";
 
 /**
@@ -14,7 +15,7 @@ export function buildServer(): McpServer {
   const server = new McpServer(
     {
       name: "sandbox-seed",
-      version: "0.2.0",
+      version: "0.2.1",
     },
     {
       instructions:
@@ -85,6 +86,46 @@ export function buildServer(): McpServer {
       },
     },
     async (args) => wrap(async () => await seed(args)),
+  );
+
+  server.registerTool(
+    "playbook",
+    {
+      title: "Run a multi-step sandbox-seed flow defined in a YAML playbook",
+      description:
+        "Chain N ordered seed steps into one run. A playbook is a YAML file at " +
+        "`~/.sandbox-seed/playbooks/<name>.yml` (user-scope only — no project/team scope) " +
+        "listing 3+ seed steps to execute in order. Each step uses the SAME shape as " +
+        "`seed action:\"start\"` args. Cross-step (and cross-run) FK stitching happens " +
+        "automatically via the persistent project-level id-map at " +
+        "`~/.sandbox-seed/id-maps/`.\n\n" +
+        "WHEN TO USE THIS TOOL\n" +
+        "  Multi-step refresh workflows the user already knows the order of:\n" +
+        "    • 'after the sandbox refresh, seed Accounts → Contacts → Opps → Tasks'\n" +
+        "    • 'run my demo-refresh playbook'\n" +
+        "    • 'execute the q1-uat playbook against dev-full'\n\n" +
+        "WHEN NOT TO USE THIS TOOL\n" +
+        "  • Single-object seed → use the `seed` tool directly.\n" +
+        "  • Ad-hoc one-off (no YAML on disk yet) → use `seed`; promote to a playbook later.\n\n" +
+        "HOW TO CALL IT\n" +
+        "  Three actions, dry-run gate identical to `seed`:\n" +
+        "    1. action:\"list\"     {} — discover available playbooks\n" +
+        "    2. action:\"dry_run\"  { name } — drives every step through start→analyze→select→dry_run, writes ONE aggregated report, returns a playbookRunId\n" +
+        "    3. action:\"run\"      { playbookRunId, confirm:true } — only after the user has reviewed the aggregated report and explicitly approved\n\n" +
+        "  Each step honors the same hard rules as `seed` (sandbox-only target, SOQL " +
+        "WHERE clauses typed by the user, dry_run mandatory). Errors in step N abort " +
+        "the run unless that step is marked `continueOnError: true`.\n\n" +
+        "AI-BOUNDARY: every response is metadata only — counts, paths, plan ids. The " +
+        "aggregated report and the per-step session reports stay on disk; the AI " +
+        "references them by path.",
+      inputSchema: PlaybookArgs.shape,
+      annotations: {
+        openWorldHint: true,
+        destructiveHint: false,
+        idempotentHint: false,
+      },
+    },
+    async (args) => wrap(async () => await playbook(args)),
   );
 
   return server;
