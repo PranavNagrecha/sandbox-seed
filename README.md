@@ -83,118 +83,63 @@ The tests under `tests/mcp/` encode these rules — start there if you're auditi
 
 ---
 
-## Walkthrough — from zero to a seeded sandbox
+## Walkthrough — copy the prompts from a real session
 
-A full copy-paste guide for someone who has never used this tool before. Assumes you have a source org (e.g. production) and a target sandbox.
+The fastest way to learn this tool is to read a real chat transcript and copy the prompts into your own agent. **[docs/WALKTHROUGH.md](docs/WALKTHROUGH.md)** contains four full verbatim sessions covering:
 
-### Step 1 — Install the Salesforce CLI and log in to both orgs
+- A happy-path Case seed (306/308 inserts, 2 target-validation-rule failures)
+- A clean 1,271-row run with zero errors
+- Three common first-time mistakes the tool catches (full `SELECT` strings, `limit` too low, WHERE matches zero)
+- How to ask the agent to describe the tool before you call it
 
-If you don't already have `sf`:
+One prompt shape you can paste straight into Cursor, Claude Desktop, or any MCP-aware host:
 
-```bash
-# macOS
-brew install sfdx-cli
+```
+action: "start"
+sourceOrg: "<your source alias>"
+targetOrg: "<your target sandbox alias>"
+object: "Case"
+whereClause: "IsClosed = false AND CreatedDate = THIS_YEAR"
+sampleSize: 100
+disableValidationRulesOnRun: true
 
-# Windows / Linux
-npm i -g @salesforce/cli
+USE MCP: sandbox-seed
 ```
 
-Then log in to both the **source** org (where the data lives) and the **target** sandbox (where it's going):
+Then for each subsequent step, paste back the JSON the agent suggests:
 
-```bash
-sf org login web --alias prod-source
-sf org login web --alias dev-target
+```json
+{ "action": "analyze", "sessionId": "<session-id-from-start>" }
 ```
-
-Each command opens a browser; finish the Salesforce login and close the tab. Verify both aliases are registered:
-
-```bash
-sf org list
-```
-
-![sf org list output](docs/screenshots/01-sf-org-list.png)
-<!-- SCREENSHOT TO ADD: terminal output of `sf org list` showing both aliases -->
-
-### Step 2 — Add `sandbox-seed` to your AI host
-
-Pick your MCP host below and paste the config block. Restart the host after saving.
-
-**Claude Desktop** — `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%AppData%\Claude\claude_desktop_config.json` (Windows):
 
 ```json
 {
-  "mcpServers": {
-    "sandbox-seed": {
-      "command": "npx",
-      "args": ["-y", "-p", "sandbox-seed", "sandbox-seed-mcp"]
-    }
-  }
+  "action": "select",
+  "sessionId": "<session-id>",
+  "includeOptionalParents": ["Account", "Contact"],
+  "includeOptionalChildren": ["CaseComment", "Task"]
 }
 ```
 
-**Cursor** — `~/.cursor/mcp.json` — use the same block.
-
-**Project-scoped (any host)** — drop it in `.mcp.json` at your project root.
-
-![MCP config pasted in Claude Desktop](docs/screenshots/02-mcp-config.png)
-<!-- SCREENSHOT TO ADD: the config file open in an editor with the sandbox-seed block highlighted -->
-
-### Step 3 — Ask the agent to seed
-
-Once the host is restarted, ask the model a concrete question. **Write your own SOQL WHERE clause** — the tool refuses to invent predicates from natural language, so vague prompts get sent back for a real SOQL snippet.
-
-> "Seed `dev-target` from `prod-source` with the Account whose Id is `0011x00000ABCdEFGHI`. Include all direct-child Contacts and Opportunities."
-
-Or with a filtered WHERE:
-
-> "Seed `dev-target` from `prod-source`. Root object: `Opportunity`. WHERE clause: `CloseDate = LAST_QUARTER AND Amount > 50000`. Sample size: 100."
-
-The agent will walk the five-step flow (`analyze` → `select` → `dry_run` → `run`) one tool call at a time. You only need to confirm at two points:
-
-1. **After `select`** — the agent proposes which optional child and parent objects to include. You accept, edit, or reject.
-2. **After `dry_run`** — you read the dry-run report (path printed in chat), verify the counts, then say "run it" to trigger the actual inserts.
-
-![Agent calling seed tool in Claude Desktop](docs/screenshots/03-agent-seed-flow.png)
-<!-- SCREENSHOT TO ADD: Claude Desktop transcript showing the agent invoking `seed` with stage indicators -->
-
-### Step 4 — Review the dry-run report before confirming
-
-The dry-run report lives on your disk (the AI never sees it). The path is printed in chat. Open it:
-
-```bash
-# macOS
-open ~/.sandbox-seed/sessions/<session-id>/dry-run.md
-
-# or just cat it
-cat ~/.sandbox-seed/sessions/<session-id>/dry-run.md
+```json
+{ "action": "dry_run", "sessionId": "<session-id>" }
 ```
 
-It contains: per-object record counts, the SOQL that will be executed, the list of target-org schema differences that will be auto-skipped, and the first 100 source record Ids. Verify the counts match what you expect **before** telling the agent to run.
-
-![Dry-run report opened in an editor](docs/screenshots/04-dry-run-report.png)
-<!-- SCREENSHOT TO ADD: dry-run.md open in an editor, scope-summary table visible -->
-
-### Step 5 — Run it
-
-Tell the agent:
-
-> "Looks good, run it."
-
-The `run` tool call does the actual inserts, writing a detailed log per record. The agent reports a count of successes and failures; failures are in the log path it prints.
-
-```bash
-cat ~/.sandbox-seed/sessions/<session-id>/execute.log
+```json
+{ "action": "run", "sessionId": "<session-id>", "confirm": true }
 ```
 
-![Run complete summary in chat](docs/screenshots/05-run-complete.png)
-<!-- SCREENSHOT TO ADD: Claude Desktop showing "Run complete with N inserted, M errors" -->
+**Prerequisites:**
+1. Salesforce CLI installed (`brew install sfdx-cli` or `npm i -g @salesforce/cli`) and both orgs logged in with `sf org login web --alias <name>`.
+2. `sandbox-seed` registered in your MCP host config (see the 30-second setup block above).
 
-### Troubleshooting
+### Troubleshooting (from real sessions)
 
-- **"WHERE clause returned 0 records"** — your SOQL matches nothing. Test it in Workbench or with `sf data query --query "SELECT COUNT() FROM …"` first.
-- **"Target org must be a sandbox"** — you pointed the target at production. The tool refuses. Use a sandbox.
-- **Field validation errors in `execute.log`** — target-org validation rules rejected some rows (required fields, picklist values, etc.). Pass `disableValidationRules: true` to `run` to snapshot + deactivate them around the insert, then restore.
-- **`DUPLICATE_VALUE` errors on re-run** — you've already seeded those rows. If the object has an external-id field, the tool auto-picks UPSERT; otherwise run against a clean sandbox.
+- **"WHERE clause matched 0 records on \<object\>"** — your SOQL matches nothing. Test it in Workbench or `sf data query` first, or relax the filter.
+- **"WHERE clause matched N records, exceeding limit M"** — `limit` is a safety cap, not a SOQL `LIMIT`. Either raise `limit`, tighten the predicate, or use `sampleSize: N` (deterministic "first N by `ORDER BY Id`").
+- **"sandbox_seed_seed does not take a full SELECT string"** — `whereClause` is the predicate only. Drop the `SELECT … FROM … LIMIT …` parts.
+- **`FIELD_CUSTOM_VALIDATION_EXCEPTION` in `execute.log`** — target-org validation rules rejected some rows. Pass `disableValidationRulesOnRun: true` to `start` to snapshot + deactivate them around the insert, then restore.
+- **`DUPLICATE_VALUE` on re-run** — you've already seeded those rows. Objects with an external-id field auto-route through UPSERT on re-runs; otherwise run against a clean sandbox.
 
 ---
 
