@@ -9,7 +9,10 @@ import {
   CASE,
   CASE_COMMENT,
   CONTACT,
+  CONTACT_WITH_REPORTS_TO,
   OPPORTUNITY,
+  OPPORTUNITY_WITH_PRICEBOOK,
+  PRICEBOOK2,
   TASK,
   USER,
 } from "../fixtures/describes.ts";
@@ -288,5 +291,82 @@ describe("runInspect", () => {
       skipGlobalValidate: true,
     });
     expect(calls.length).toBeGreaterThan(firstCount);
+  });
+
+  it("resolves child-lookup targets (self-ref): Contact.ReportsToId when root=Account", async () => {
+    const { fetchFn } = makeFetch({ Contact: CONTACT_WITH_REPORTS_TO });
+    const result = await runInspect({
+      auth: fakeAuth(),
+      rootObject: "Account",
+      parentWalkDepth: 1,
+      includeChildren: true,
+      includeCounts: false,
+      cacheTtlSeconds: 3600,
+      bypassCache: false,
+      cacheRoot,
+      fetchFn: fetchFn as unknown as typeof fetch,
+      skipGlobalValidate: true,
+      childLookups: { Contact: ["ReportsToId"] },
+    });
+    // Self-ref target (Contact) is already in describes via child walk; not added
+    // to childLookupTargets (per walkFromRoot comment).
+    expect(result.childLookupTargets).not.toContain("Contact");
+    expect(result.graph.nodes.has("Contact")).toBe(true);
+    // buildGraph should emit the self-edge from Contact.ReportsToId.
+    const selfEdge = result.graph.edges.find(
+      (e) => e.source === "Contact" && e.target === "Contact" && e.fieldName === "ReportsToId",
+    );
+    expect(selfEdge).toBeDefined();
+  });
+
+  it("resolves child-lookup targets (cross-sibling): Opportunity.Pricebook2Id pulls Pricebook2", async () => {
+    const { fetchFn } = makeFetch({
+      Opportunity: OPPORTUNITY_WITH_PRICEBOOK,
+      Pricebook2: PRICEBOOK2,
+    });
+    const result = await runInspect({
+      auth: fakeAuth(),
+      rootObject: "Account",
+      parentWalkDepth: 1,
+      includeChildren: true,
+      includeCounts: false,
+      cacheTtlSeconds: 3600,
+      bypassCache: false,
+      cacheRoot,
+      fetchFn: fetchFn as unknown as typeof fetch,
+      skipGlobalValidate: true,
+      childLookups: { Opportunity: ["Pricebook2Id"] },
+    });
+    expect(result.childLookupTargets).toContain("Pricebook2");
+    expect(result.graph.nodes.has("Pricebook2")).toBe(true);
+    const edge = result.graph.edges.find(
+      (e) => e.source === "Opportunity" && e.target === "Pricebook2" && e.fieldName === "Pricebook2Id",
+    );
+    expect(edge).toBeDefined();
+  });
+
+  it("child-lookup does not transitively walk beyond one hop", async () => {
+    // If Pricebook2 had its own references, we must NOT walk them.
+    // PRICEBOOK2 fixture has none, so asserting no unexpected extra nodes.
+    const { fetchFn } = makeFetch({
+      Opportunity: OPPORTUNITY_WITH_PRICEBOOK,
+      Pricebook2: PRICEBOOK2,
+    });
+    const result = await runInspect({
+      auth: fakeAuth(),
+      rootObject: "Account",
+      parentWalkDepth: 1,
+      includeChildren: true,
+      includeCounts: false,
+      cacheTtlSeconds: 3600,
+      bypassCache: false,
+      cacheRoot,
+      fetchFn: fetchFn as unknown as typeof fetch,
+      skipGlobalValidate: true,
+      childLookups: { Opportunity: ["Pricebook2Id"] },
+    });
+    // Pricebook2 has no references — confirm it's a leaf (no outgoing parent edges).
+    const outgoing = result.graph.edges.filter((e) => e.source === "Pricebook2");
+    expect(outgoing).toHaveLength(0);
   });
 });

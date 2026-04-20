@@ -98,7 +98,13 @@ export async function queryRecords(opts: {
  *                 Requires ID materialization, not a single subquery.
  *   - unknown: no path from root in the graph — unseedable for this scope.
  */
-export type ScopePathKind = "root" | "direct-parent" | "direct-child" | "transitive" | "unknown";
+export type ScopePathKind =
+  | "root"
+  | "direct-parent"
+  | "direct-child"
+  | "transitive"
+  | "child-lookup"
+  | "unknown";
 
 export type ScopePath = {
   object: string;
@@ -109,12 +115,25 @@ export type ScopePath = {
   childFk?: string;
   /** For transitive: the chain of objects from this object up to the root. */
   chain?: string[];
+  /**
+   * For "child-lookup": the intermediate direct-child of root whose
+   * user-selected lookup field reaches `object`.
+   */
+  childObject?: string;
+  /** For "child-lookup": the FK field on `childObject` pointing back to root. */
+  childFkToRoot?: string;
+  /**
+   * For "child-lookup": the reference field on `childObject` whose value
+   * is the target Id of type `object`.
+   */
+  lookupField?: string;
 };
 
 export function computeScopePaths(
   graph: DependencyGraph,
   root: string,
   finalObjectList: string[],
+  childLookups?: Record<string, string[]>,
 ): ScopePath[] {
   // Index edges by source/target for fast lookups.
   const edgesBySource = new Map<string, Array<{ target: string } & EdgeAttrs>>();
@@ -128,30 +147,79 @@ export function computeScopePaths(
     edgesByTarget.set(e.target, byTgt);
   }
 
-  return finalObjectList.map((object): ScopePath => {
-    if (object === root) return { object, kind: "root" };
+  // An object can be reachable from the root via multiple paths simultaneously:
+  // e.g. Account is a direct-parent of Contact (via Contact.AccountId) AND a
+  // child-lookup target of a direct-child of Contact (via e.g.
+  // hed__Application__c.hed__Applying_To__c). These paths resolve to DIFFERENT
+  // ID sets. Returning only the first match misses the Child+1 targets at
+  // run time: the FK on the child record can't be resolved because the
+  // target was never fetched. So we return ALL applicable paths per object;
+  // callers union the ID sets.
+  const results: ScopePath[] = [];
+  for (const object of finalObjectList) {
+    if (object === root) {
+      results.push({ object, kind: "root" });
+      continue;
+    }
 
-    // Direct parent: root → object via some FK field on root.
+    const before = results.length;
+
+    // Direct parent: root → object via some FK field on root. Can be multiple
+    // distinct reference fields on root all targeting the same object.
     const rootOut = edgesBySource.get(root) ?? [];
-    const direct = rootOut.find((e) => e.target === object && e.kind === "parent");
-    if (direct !== undefined) {
-      return { object, kind: "direct-parent", rootFk: direct.fieldName };
+    for (const e of rootOut) {
+      if (e.target === object && e.kind === "parent") {
+        results.push({ object, kind: "direct-parent", rootFk: e.fieldName });
+      }
     }
 
     // Direct child: object → root via some FK field on object.
     const objectOut = edgesBySource.get(object) ?? [];
-    const asChild = objectOut.find((e) => e.target === root && (e.kind === "child" || e.kind === "parent"));
-    if (asChild !== undefined) {
-      return { object, kind: "direct-child", childFk: asChild.fieldName };
+    for (const e of objectOut) {
+      if (e.target === root && (e.kind === "child" || e.kind === "parent")) {
+        results.push({ object, kind: "direct-child", childFk: e.fieldName });
+      }
     }
 
-    // Transitive parent: BFS up the parent-edge chain from root until we
-    // hit `object`. Stop after a modest bound so we don't explore forever.
-    const chain = findParentChain(edgesBySource, root, object, 4);
-    if (chain !== null) return { object, kind: "transitive", chain };
+    // Child + 1 lookup: always add when it applies, even if a direct-parent
+    // match already exists — the ID sets may differ, and we want both.
+    if (childLookups !== undefined) {
+      for (const [childObj, fieldNames] of Object.entries(childLookups)) {
+        const childOutEdges = edgesBySource.get(childObj) ?? [];
+        const match = childOutEdges.find(
+          (e) =>
+            e.target === object &&
+            (e.kind === "parent" || e.kind === "self") &&
+            fieldNames.includes(e.fieldName),
+        );
+        if (match === undefined) continue;
+        const backEdge = childOutEdges.find(
+          (e) => e.target === root && (e.kind === "child" || e.kind === "parent"),
+        );
+        if (backEdge === undefined) continue;
+        results.push({
+          object,
+          kind: "child-lookup",
+          childObject: childObj,
+          childFkToRoot: backEdge.fieldName,
+          lookupField: match.fieldName,
+        });
+      }
+    }
 
-    return { object, kind: "unknown" };
-  });
+    if (results.length > before) continue;
+
+    // Transitive parent (only if nothing direct was found): BFS up the parent
+    // chain from root until we hit `object`. Stop after a modest bound.
+    const chain = findParentChain(edgesBySource, root, object, 4);
+    if (chain !== null) {
+      results.push({ object, kind: "transitive", chain });
+      continue;
+    }
+
+    results.push({ object, kind: "unknown" });
+  }
+  return results;
 }
 
 function findParentChain(

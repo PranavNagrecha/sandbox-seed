@@ -79,6 +79,12 @@ export type ExecuteOptions = {
    * what the user saw in the dry-run report.
    */
   upsertDecisions?: Record<string, UpsertDecisionSummary>;
+  /**
+   * User-selected "Child + 1" lookups. Forwarded to computeScopePaths and
+   * composeScopeSoql so lookup-target objects get a resolvable scope.
+   * See src/seed/extract.ts ScopePath kind="child-lookup".
+   */
+  childLookups?: Record<string, string[]>;
 };
 
 const BATCH_SIZE = 200;
@@ -93,9 +99,19 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteSummary> 
   const idMap = new IdMap(idMapPath);
   await idMap.load();
 
-  const scopePaths = new Map<string, ScopePath>();
-  for (const p of computeScopePaths(opts.graph, opts.rootObject, opts.finalObjectList)) {
-    scopePaths.set(p.object, p);
+  // An object may have multiple paths (e.g. both direct-parent and
+  // child-lookup resolve to different ID sets). Group by object; the
+  // fetchers below union records across paths, deduping by Id.
+  const scopePaths = new Map<string, ScopePath[]>();
+  for (const p of computeScopePaths(
+    opts.graph,
+    opts.rootObject,
+    opts.finalObjectList,
+    opts.childLookups,
+  )) {
+    const list = scopePaths.get(p.object) ?? [];
+    list.push(p);
+    scopePaths.set(p.object, list);
   }
 
   const insertedCounts: Record<string, number> = {};
@@ -156,15 +172,16 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteSummary> 
       if (step.kind === "single") {
         const object = step.object;
         if (!opts.finalObjectList.includes(object)) continue;
-        const scope = scopePaths.get(object);
-        if (scope === undefined || scope.kind === "unknown") {
+        const paths = scopePaths.get(object);
+        const resolvable = (paths ?? []).filter((p) => p.kind !== "unknown");
+        if (resolvable.length === 0) {
           await appendLog(`SKIP ${object}: no resolvable scope from root.`);
           insertedCounts[object] = 0;
           continue;
         }
         const res = await seedSingle({
           object,
-          scope,
+          scopes: resolvable,
           opts,
           fetchFn,
           idMap,
@@ -238,14 +255,14 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteSummary> 
 
 async function seedSingle(args: {
   object: string;
-  scope: ScopePath;
+  scopes: ScopePath[];
   opts: ExecuteOptions;
   fetchFn: typeof fetch;
   idMap: IdMap;
   rootIds: string[];
   appendLog: (msg: string) => Promise<void>;
 }): Promise<{ inserted: number; errors: number }> {
-  const { object, scope, opts, fetchFn, idMap, rootIds, appendLog } = args;
+  const { object, scopes, opts, fetchFn, idMap, rootIds, appendLog } = args;
 
   const srcDescribe = await opts.sourceDescribe.describeObject(object);
   const allCreateable = pickCreateableFields(srcDescribe);
@@ -267,25 +284,40 @@ async function seedSingle(args: {
     return { inserted: 0, errors: 0 };
   }
 
-  const soql = composeScopeSoql({
-    scope,
-    object,
-    fields: ["Id", ...createable.map((f) => f.name)],
-    rootObject: opts.rootObject,
-    whereClause: opts.whereClause,
-    rootIds,
-  });
-  if (soql === null) {
-    await appendLog(`SKIP ${object}: could not compose scope SOQL.`);
+  // Union records across every applicable path, deduping by Id.
+  const byId = new Map<string, Record<string, unknown>>();
+  for (const scope of scopes) {
+    const soql = composeScopeSoql({
+      scope,
+      object,
+      fields: ["Id", ...createable.map((f) => f.name)],
+      rootObject: opts.rootObject,
+      whereClause: opts.whereClause,
+      rootIds,
+    });
+    if (soql === null) {
+      await appendLog(`${object}: skipping path kind=${scope.kind} (unable to compose SOQL).`);
+      continue;
+    }
+    const subRecords = await queryRecords({
+      auth: opts.sourceAuth,
+      soql,
+      fetchFn,
+    });
+    for (const r of subRecords) {
+      const id = (r as { Id?: unknown }).Id;
+      if (typeof id === "string") byId.set(id, r);
+    }
+    await appendLog(
+      `${object}: path kind=${scope.kind} fetched ${subRecords.length} record(s) (union now ${byId.size}).`,
+    );
+  }
+  const records = [...byId.values()];
+  if (records.length === 0) {
+    await appendLog(`SKIP ${object}: no records returned by any scope path.`);
     return { inserted: 0, errors: 0 };
   }
-
-  const records = await queryRecords({
-    auth: opts.sourceAuth,
-    soql,
-    fetchFn,
-  });
-  await appendLog(`${object}: fetched ${records.length} source record(s).`);
+  await appendLog(`${object}: total unique source record(s) across paths: ${records.length}.`);
 
   // Resolve the upsert decision for this object. `picked` → route records
   // whose external-id value is populated through composite UPSERT; records
@@ -396,7 +428,7 @@ async function seedCycle(args: {
   fetchFn: typeof fetch;
   idMap: IdMap;
   rootIds: string[];
-  scopePaths: Map<string, ScopePath>;
+  scopePaths: Map<string, ScopePath[]>;
   appendLog: (msg: string) => Promise<void>;
 }): Promise<{ inserted: Record<string, number>; errors: number }> {
   const { step, opts, fetchFn, idMap, rootIds, scopePaths, appendLog } = args;
@@ -422,8 +454,8 @@ async function seedCycle(args: {
 
   for (const object of step.objects) {
     if (!opts.finalObjectList.includes(object)) continue;
-    const scope = scopePaths.get(object);
-    if (scope === undefined || scope.kind === "unknown") {
+    const paths = (scopePaths.get(object) ?? []).filter((p) => p.kind !== "unknown");
+    if (paths.length === 0) {
       await appendLog(`SKIP ${object} in cycle: no scope.`);
       continue;
     }
@@ -439,17 +471,25 @@ async function seedCycle(args: {
         `${object} [cycle]: skipping ${dropped.length} source-only field(s) not present on target: ${dropped.slice(0, 20).join(", ")}${dropped.length > 20 ? ", …" : ""}`,
       );
     }
-    const soql = composeScopeSoql({
-      scope,
-      object,
-      fields: ["Id", ...createable.map((f) => f.name)],
-      rootObject: opts.rootObject,
-      whereClause: opts.whereClause,
-      rootIds,
-    });
-    if (soql === null) continue;
-    const records = await queryRecords({ auth: opts.sourceAuth, soql, fetchFn });
-    await appendLog(`${object} [cycle phase 1]: fetched ${records.length} source record(s).`);
+    const byId = new Map<string, Record<string, unknown>>();
+    for (const scope of paths) {
+      const soql = composeScopeSoql({
+        scope,
+        object,
+        fields: ["Id", ...createable.map((f) => f.name)],
+        rootObject: opts.rootObject,
+        whereClause: opts.whereClause,
+        rootIds,
+      });
+      if (soql === null) continue;
+      const subRecords = await queryRecords({ auth: opts.sourceAuth, soql, fetchFn });
+      for (const r of subRecords) {
+        const id = (r as { Id?: unknown }).Id;
+        if (typeof id === "string") byId.set(id, r);
+      }
+    }
+    const records = [...byId.values()];
+    await appendLog(`${object} [cycle phase 1]: unioned ${records.length} source record(s) across ${paths.length} path(s).`);
 
     const perIdMap = new Map<string, Record<string, unknown>>();
     for (const r of records) {
@@ -700,12 +740,17 @@ function composeScopeSoql(args: {
   switch (args.scope.kind) {
     case "root":
       return `SELECT ${fieldList} FROM ${args.object} WHERE ${args.whereClause}`;
-    case "direct-parent":
+    case "direct-parent": {
       if (args.scope.rootFk === undefined) return null;
+      // Materialize root IDs to avoid nested semi-join when the user's
+      // WHERE already contains one (Salesforce forbids 2+ levels).
+      const idList = soqlIdList(args.rootIds);
+      if (idList.length === 0) return null;
       return (
         `SELECT ${fieldList} FROM ${args.object} ` +
-        `WHERE Id IN (SELECT ${args.scope.rootFk} FROM ${args.rootObject} WHERE ${args.whereClause})`
+        `WHERE Id IN (SELECT ${args.scope.rootFk} FROM ${args.rootObject} WHERE Id IN (${idList}))`
       );
+    }
     case "direct-child": {
       if (args.scope.childFk === undefined) return null;
       // Prefer a subquery over materialized IDs — shorter HTTP payload.
@@ -717,6 +762,26 @@ function composeScopeSoql(args: {
       return (
         `SELECT ${fieldList} FROM ${args.object} ` +
         `WHERE ${args.scope.childFk} IN (SELECT Id FROM ${args.rootObject} WHERE ${args.whereClause})`
+      );
+    }
+    case "child-lookup": {
+      const { childObject, lookupField, childFkToRoot } = args.scope;
+      if (
+        childObject === undefined ||
+        lookupField === undefined ||
+        childFkToRoot === undefined
+      )
+        return null;
+      // One level of SOQL nesting: materialize root IDs as a literal list
+      // for the innermost filter. This keeps us within Salesforce's "only
+      // one semi-join" limit (which would fire if we left the root scope
+      // as its own subquery).
+      const idList = soqlIdList(args.rootIds);
+      if (idList.length === 0) return null;
+      return (
+        `SELECT ${fieldList} FROM ${args.object} ` +
+        `WHERE Id IN (SELECT ${lookupField} FROM ${childObject} ` +
+        `WHERE ${childFkToRoot} IN (${idList}))`
       );
     }
     default:

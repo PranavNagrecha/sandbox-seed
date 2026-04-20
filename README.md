@@ -100,13 +100,19 @@ The tests under `tests/mcp/` encode these rules — start there if you're auditi
 
 ---
 
-## What's shipped in 0.1.0
+## What's shipped in 0.1.1
 
 - **MCP `seed` tool** — five-step SF → SF copy flow (analyze → select → dry-run → confirm → run) with cross-org FK remapping, two-phase cycle inserts, validation-rule snapshot/restore, and the AI-boundary contract.
 - **CLI `inspect` command** — read-only schema and dependency-graph exploration (tree / mermaid / dot / json).
 - Salesforce CLI auth integration (reads `~/.sf/`).
 
-Not yet shipped: synthetic data generation, PII masking, CSV import, multi-target fan-out. These are roadmap, not 0.1.0.
+Not yet shipped: synthetic data generation, PII masking, CSV import, multi-target fan-out. These are roadmap, not 0.1.1.
+
+### Scope & limitations to know about in 0.1.1
+
+- **One session = one id-map.** The source→target ID map is session-scoped (written to the session dir). Seeds cannot yet be **composed across runs** — if you seed Accounts in one session and then seed Applications in a second session, the second session does not recognize the Accounts from the first. Required lookups are skipped; nillable lookups are inserted as `null`. Workaround: seed everything you need in a single session by rooting the seed on the highest shared object (e.g. Account), so the id-map is populated in dependency order within one run. A project-level id-map that composes across runs is on the roadmap.
+- **Children's parents are not walked.** The graph walker pulls the root's direct children but does not follow those children's *other* parent lookups. If the child has FKs to objects outside your current scope, they will be skipped or nulled. Workaround: root the seed on the child instead, so its parents are walked transitively.
+- **`whereClause` cannot contain a semi-join today.** A root predicate like `Id IN (SELECT … FROM …)` causes dry-run to fail because downstream probes wrap it in another `IN (SELECT …)`, which SOQL rejects. Workaround: root the seed on the inner object, or pre-query the IDs and pass them as `Id IN ('…','…')`.
 
 ---
 
@@ -122,7 +128,7 @@ More: [docs/AUTH.md](docs/AUTH.md).
 
 ## Status
 
-Pre-release (`0.1.0`). APIs and flags may change before `1.0`. Use in sandboxes only — **never** point this at a production org as the target (the tool refuses, but don't test the refusal with real money).
+Pre-release (`0.1.1`). APIs and flags may change before `1.0`. Use in sandboxes only — **never** point this at a production org as the target (the tool refuses, but don't test the refusal with real money).
 
 Roadmap: [BACKLOG in project notes, soon to be moved into GitHub Issues].
 

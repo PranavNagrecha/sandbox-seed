@@ -1,7 +1,7 @@
 import type { OrgAuth } from "../auth/sf-auth.ts";
 import { DescribeCache } from "../describe/cache.ts";
 import { DescribeClient } from "../describe/client.ts";
-import type { SObjectDescribe } from "../describe/types.ts";
+import { type SObjectDescribe, isReference } from "../describe/types.ts";
 import { SeedError, UserError } from "../errors.ts";
 import {
   buildGraph,
@@ -36,6 +36,13 @@ export type InspectOptions = {
   fetchFn?: typeof fetch;
   /** Skip global-describe validation (unit-test shortcut). */
   skipGlobalValidate?: boolean;
+  /**
+   * User-selected "Child + 1" lookups. Key = direct-child-of-root object
+   * name; value = reference-field names on that child to walk exactly one
+   * hop further to their direct parent. No transitive recursion.
+   * See walkFromRoot() Phase 2.
+   */
+  childLookups?: Record<string, string[]>;
 };
 
 export type InspectResult = {
@@ -47,6 +54,12 @@ export type InspectResult = {
   parentObjects: string[];
   /** Objects walked as 1-level children of the root. */
   childObjects: string[];
+  /**
+   * Objects pulled in by resolving user-selected `childLookups`. Subset of
+   * parentObjects; surfaced separately so callers can auto-include them in
+   * the final seed list without requiring a second `select` step.
+   */
+  childLookupTargets: string[];
 };
 
 /**
@@ -76,6 +89,7 @@ export async function runInspect(opts: InspectOptions): Promise<InspectResult> {
     parentDepth: opts.parentWalkDepth,
     includeChildren: opts.includeChildren,
     filters,
+    childLookups: opts.childLookups,
   });
 
   const rowCounts = opts.includeCounts
@@ -111,6 +125,7 @@ export async function runInspect(opts: InspectOptions): Promise<InspectResult> {
     rootObject: opts.rootObject,
     parentObjects: [...walk.parents],
     childObjects: [...walk.children],
+    childLookupTargets: [...walk.childLookupTargets],
   };
 }
 
@@ -131,6 +146,13 @@ type WalkResult = {
   parents: Set<string>;
   children: Set<string>;
   distances: Map<string, number>;
+  /**
+   * Targets resolved from user-selected `childLookups` (Phase 2). Subset of
+   * `parents` — tracked separately so the MCP layer can auto-include them
+   * in the final seed list. Self-references (child.field → child) are NOT
+   * added here, since the child is already in scope via the child walk.
+   */
+  childLookupTargets: Set<string>;
 };
 
 /**
@@ -152,12 +174,14 @@ async function walkFromRoot(
     parentDepth: number;
     includeChildren: boolean;
     filters: FieldFilterOptions;
+    childLookups?: Record<string, string[]>;
   },
 ): Promise<WalkResult> {
   const describes = new Map<string, SObjectDescribe>();
   const parents = new Set<string>();
   const children = new Set<string>();
   const distances = new Map<string, number>();
+  const childLookupTargets = new Set<string>();
 
   const rootDescribe = await client.describeObject(opts.root);
   describes.set(opts.root, rootDescribe);
@@ -240,5 +264,61 @@ async function walkFromRoot(
     }
   }
 
-  return { describes, parents, children, distances };
+  // Phase 2: "Child + 1" — user-selected lookup fields on direct children.
+  // Exactly one hop from the child to its direct parent. No transitive walk,
+  // no recursion into the target's own parents. Self-references (the target
+  // equals the child itself, e.g. Contact.ReportsToId → Contact) are a
+  // no-op: the target is already in `describes` via the child walk, and
+  // buildGraph will emit the self-edge from the child's describe for us.
+  if (opts.childLookups !== undefined) {
+    for (const [childName, fieldNames] of Object.entries(opts.childLookups)) {
+      const childDescribe = describes.get(childName);
+      if (childDescribe === undefined) {
+        // Validated at `start` to be a direct child; if we got here, the
+        // child walk was disabled (includeChildren=false). Skip rather
+        // than throw — the walker is used in multiple contexts.
+        continue;
+      }
+      const byName = new Map(childDescribe.fields.map((f) => [f.name, f]));
+      for (const fname of fieldNames) {
+        const field = byName.get(fname);
+        if (field === undefined || !isReference(field)) continue;
+        for (const target of field.referenceTo) {
+          if (target === opts.root) continue;
+          if (target === childName) continue; // self-ref — already in graph
+          if (isStandardRootObject(target)) {
+            // Surface the target as a parent-ish node but don't describe
+            // (unseedable anyway).
+            parents.add(target);
+            if (!distances.has(target)) distances.set(target, 2);
+            continue;
+          }
+          if (describes.has(target)) {
+            parents.add(target);
+            childLookupTargets.add(target);
+            if (!distances.has(target)) distances.set(target, 2);
+            continue;
+          }
+          try {
+            const targetDescribe = await client.describeObject(target);
+            describes.set(target, targetDescribe);
+          } catch (err) {
+            if (err instanceof SeedError) {
+              // Permission-denied; leave as referenced-only.
+              parents.add(target);
+              childLookupTargets.add(target);
+              distances.set(target, 2);
+              continue;
+            }
+            throw err;
+          }
+          parents.add(target);
+          childLookupTargets.add(target);
+          distances.set(target, 2);
+        }
+      }
+    }
+  }
+
+  return { describes, parents, children, distances, childLookupTargets };
 }
