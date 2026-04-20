@@ -4,26 +4,23 @@ import type { OrgAuth } from "../auth/sf-auth.ts";
 import type { DescribeClient } from "../describe/client.ts";
 import type { Field, SObjectDescribe } from "../describe/types.ts";
 import { isReference } from "../describe/types.ts";
-import type { DependencyGraph } from "../graph/build.ts";
-import { isStandardRootObject } from "../graph/standard-objects.ts";
-import type { LoadPlan, LoadStep } from "../graph/order.ts";
 import { ApiError, UserError } from "../errors.ts";
+import type { DependencyGraph } from "../graph/build.ts";
+import type { LoadPlan, LoadStep } from "../graph/order.ts";
+import { isStandardRootObject } from "../graph/standard-objects.ts";
 import { salesforceFetch } from "../salesforce-fetch.ts";
 import {
+  type ScopePath,
   chunkIds,
   computeScopePaths,
   queryIds,
   queryRecords,
   soqlIdList,
-  type ScopePath,
 } from "./extract.ts";
 import { IdMap } from "./id-map.ts";
 import { ProjectIdMap, type TargetIdentity } from "./project-id-map.ts";
 import type { ExecuteSummary, UpsertDecisionSummary } from "./session.ts";
-import {
-  reactivateFromSnapshot,
-  snapshotAndDeactivate,
-} from "./validation-rule-toggle.ts";
+import { reactivateFromSnapshot, snapshotAndDeactivate } from "./validation-rule-toggle.ts";
 
 /**
  * The full run. For each step of the restricted load plan:
@@ -205,9 +202,7 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteSummary> 
     fetchFn,
   });
   if (rootIds.length === 0) {
-    throw new UserError(
-      `WHERE clause returned 0 records on ${opts.rootObject}. Nothing to seed.`,
-    );
+    throw new UserError(`WHERE clause returned 0 records on ${opts.rootObject}. Nothing to seed.`);
   }
   await appendLog(`Root scope: ${rootIds.length} ${opts.rootObject} record(s).`);
 
@@ -255,8 +250,7 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteSummary> 
         insertedCounts[object] = res.inserted;
         errorCount += res.errors;
         if (res.alreadySeeded > 0) {
-          alreadySeededCounts[object] =
-            (alreadySeededCounts[object] ?? 0) + res.alreadySeeded;
+          alreadySeededCounts[object] = (alreadySeededCounts[object] ?? 0) + res.alreadySeeded;
         }
       } else if (step.kind === "cycle") {
         await appendLog(
@@ -423,8 +417,7 @@ async function seedSingle(args: {
   // the whole request if any row lacks the key). `ambiguous` or absent →
   // INSERT for every row (pre-upsert behavior).
   const decision = opts.upsertDecisions?.[object];
-  const upsertField =
-    decision !== undefined && decision.kind === "picked" ? decision.field : null;
+  const upsertField = decision !== undefined && decision.kind === "picked" ? decision.field : null;
   if (upsertField !== null) {
     await appendLog(
       `${object}: UPSERT on external-id ${upsertField}; rows with blank ${upsertField} fall back to INSERT.`,
@@ -551,9 +544,7 @@ async function seedCycle(args: {
   const { step, opts, fetchFn, idMap, rootIds, scopePaths, appendLog } = args;
 
   if (step.breakEdge === null) {
-    await appendLog(
-      `SKIP cycle ${step.objects.join(",")}: no nillable break edge available.`,
-    );
+    await appendLog(`SKIP cycle ${step.objects.join(",")}: no nillable break edge available.`);
     return { inserted: {}, errors: 0 };
   }
 
@@ -606,7 +597,9 @@ async function seedCycle(args: {
       }
     }
     const records = [...byId.values()];
-    await appendLog(`${object} [cycle phase 1]: unioned ${records.length} source record(s) across ${paths.length} path(s).`);
+    await appendLog(
+      `${object} [cycle phase 1]: unioned ${records.length} source record(s) across ${paths.length} path(s).`,
+    );
 
     const perIdMap = new Map<string, Record<string, unknown>>();
     for (const r of records) {
@@ -615,43 +608,113 @@ async function seedCycle(args: {
     }
     recordsBySourceId.set(object, perIdMap);
 
+    // Resolve the upsert decision for this cycle object. Mirrors the
+    // single-step path in seedSingle: `picked` routes ext-id-populated
+    // rows through composite UPSERT; anything else (including missing
+    // ext-id value) falls back to INSERT. Without this, re-running a
+    // cycle-object seed fails every row with DUPLICATE_VALUE on the
+    // ext-id field — the dry-run contract promised UPSERT and the
+    // executor silently did INSERT.
+    const decision = opts.upsertDecisions?.[object];
+    const upsertField =
+      decision !== undefined && decision.kind === "picked" ? decision.field : null;
+    if (upsertField !== null) {
+      await appendLog(
+        `${object} [cycle]: UPSERT on external-id ${upsertField}; rows with blank ${upsertField} fall back to INSERT.`,
+      );
+    } else if (decision !== undefined && decision.kind === "ambiguous") {
+      await appendLog(
+        `${object} [cycle]: INSERT (upsert-key ambiguous: ${decision.reason} — ${decision.detail}).`,
+      );
+    }
+
     let objectInserted = 0;
     for (const chunk of chunkIds(records, BATCH_SIZE)) {
-      const payload: Array<Record<string, unknown>> = [];
-      const sourceIdsForInserted: string[] = [];
+      const upsertRewrites: Array<{ body: Record<string, unknown>; sourceId: string }> = [];
+      const insertRewrites: Array<{ body: Record<string, unknown>; sourceId: string }> = [];
       for (const rec of chunk) {
         const rewritten = rewriteRecordForTarget(object, rec, createable, idMap);
         if (rewritten === null) {
           errors++;
           continue;
         }
-        // Null the break-edge field on the source of the break edge during phase 1.
-        if (object === breakSource) {
-          rewritten[breakField] = null;
-        }
-        payload.push(rewritten);
         const srcId = (rec as Record<string, unknown>).Id;
-        sourceIdsForInserted.push(typeof srcId === "string" ? srcId : "");
+        const sourceId = typeof srcId === "string" ? srcId : "";
+
+        let routeToUpsert = false;
+        if (upsertField !== null) {
+          const v = rewritten[upsertField];
+          if (v !== null && v !== undefined && v !== "") {
+            routeToUpsert = true;
+          }
+        }
+
+        // Break-edge handling in phase 1:
+        //   INSERT path — null the break-field so Salesforce accepts the
+        //     row before the sibling exists; phase 2 PATCHes the real FK.
+        //   UPSERT path — OMIT the break-field entirely. If the row
+        //     matches an existing target, Salesforce leaves the field's
+        //     live value alone (sending null would overwrite it). If the
+        //     row is newly inserted via upsert, the field lands null and
+        //     phase 2 still backfills it from the id-map. Either way,
+        //     the final state after phase 2 is correct.
+        if (object === breakSource) {
+          if (routeToUpsert) {
+            delete rewritten[breakField];
+          } else {
+            rewritten[breakField] = null;
+          }
+        }
+
+        if (routeToUpsert) {
+          upsertRewrites.push({ body: rewritten, sourceId });
+        } else {
+          insertRewrites.push({ body: rewritten, sourceId });
+        }
       }
 
-      if (payload.length === 0) continue;
-      const results = await compositeInsert({
-        auth: opts.targetAuth,
-        object,
-        records: payload,
-        fetchFn,
-      });
-      for (let i = 0; i < results.length; i++) {
-        const r = results[i];
-        const sourceId = sourceIdsForInserted[i];
-        if (r.success && typeof r.id === "string" && sourceId.length > 0) {
-          idMap.set(object, sourceId, r.id);
-          objectInserted++;
-        } else {
-          errors++;
-          await appendLog(
-            `${object} [cycle phase 1]: insert failed for sourceId=${sourceId} — ${JSON.stringify(r.errors ?? [])}`,
-          );
+      if (upsertRewrites.length > 0 && upsertField !== null) {
+        const results = await compositeUpsert({
+          auth: opts.targetAuth,
+          object,
+          externalIdField: upsertField,
+          records: upsertRewrites.map((r) => r.body),
+          fetchFn,
+        });
+        for (let i = 0; i < results.length; i++) {
+          const r = results[i];
+          const sourceId = upsertRewrites[i].sourceId;
+          if (r.success && typeof r.id === "string" && sourceId.length > 0) {
+            idMap.set(object, sourceId, r.id);
+            objectInserted++;
+          } else {
+            errors++;
+            await appendLog(
+              `${object} [cycle phase 1]: upsert failed for sourceId=${sourceId} — ${JSON.stringify(r.errors ?? [])}`,
+            );
+          }
+        }
+      }
+
+      if (insertRewrites.length > 0) {
+        const results = await compositeInsert({
+          auth: opts.targetAuth,
+          object,
+          records: insertRewrites.map((r) => r.body),
+          fetchFn,
+        });
+        for (let i = 0; i < results.length; i++) {
+          const r = results[i];
+          const sourceId = insertRewrites[i].sourceId;
+          if (r.success && typeof r.id === "string" && sourceId.length > 0) {
+            idMap.set(object, sourceId, r.id);
+            objectInserted++;
+          } else {
+            errors++;
+            await appendLog(
+              `${object} [cycle phase 1]: insert failed for sourceId=${sourceId} — ${JSON.stringify(r.errors ?? [])}`,
+            );
+          }
         }
       }
     }
@@ -919,11 +982,7 @@ function composeScopeSoql(args: {
     }
     case "child-lookup": {
       const { childObject, lookupField, childFkToRoot } = args.scope;
-      if (
-        childObject === undefined ||
-        lookupField === undefined ||
-        childFkToRoot === undefined
-      )
+      if (childObject === undefined || lookupField === undefined || childFkToRoot === undefined)
         return null;
       // One level of SOQL nesting: materialize root IDs as a literal list
       // for the innermost filter. This keeps us within Salesforce's "only
@@ -1066,9 +1125,7 @@ async function compositeUpsert(args: {
   try {
     return (await res.json()) as CompositeResult[];
   } catch (err) {
-    throw new ApiError(
-      `composite/sobjects upsert returned non-JSON: ${(err as Error).message}`,
-    );
+    throw new ApiError(`composite/sobjects upsert returned non-JSON: ${(err as Error).message}`);
   }
 }
 
@@ -1099,9 +1156,7 @@ async function compositeInsert(args: {
   try {
     return (await res.json()) as CompositeResult[];
   } catch (err) {
-    throw new ApiError(
-      `composite/sobjects returned non-JSON: ${(err as Error).message}`,
-    );
+    throw new ApiError(`composite/sobjects returned non-JSON: ${(err as Error).message}`);
   }
 }
 
