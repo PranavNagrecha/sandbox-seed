@@ -11,12 +11,26 @@ import { readFileSync, writeFileSync } from "node:fs";
 
 import { seed } from "../dist/mcp/tools/seed.js";
 
-const SOURCE = "prod-source";
-const TARGET = "dev-target";
-const OBJECT = "Contact";
-const WHERE =
-  "Id IN (SELECT hed__Applicant__c FROM hed__Application__c " +
-  "WHERE hed__Application_Status__c IN ('Submitted', 'On Hold'))";
+// Config comes from env so no org identifiers are committed.
+//   SEED_SOURCE_ORG   — sf alias of the source org
+//   SEED_TARGET_ORG   — sf alias of the target sandbox
+//   SEED_OBJECT       — root object (default: Contact)
+//   SEED_WHERE        — SOQL WHERE predicate
+//   SEED_CHILD_LOOKUPS — optional JSON, e.g. '{"Opportunity":["Pricebook2Id"]}'
+const SOURCE = process.env.SEED_SOURCE_ORG;
+const TARGET = process.env.SEED_TARGET_ORG;
+const OBJECT = process.env.SEED_OBJECT ?? "Contact";
+const WHERE = process.env.SEED_WHERE;
+if (SOURCE === undefined || TARGET === undefined || WHERE === undefined) {
+  process.stderr.write(
+    "Missing env: set SEED_SOURCE_ORG, SEED_TARGET_ORG, SEED_WHERE (and optionally SEED_OBJECT, SEED_CHILD_LOOKUPS).\n",
+  );
+  process.exit(2);
+}
+const CHILD_LOOKUPS =
+  process.env.SEED_CHILD_LOOKUPS !== undefined
+    ? JSON.parse(process.env.SEED_CHILD_LOOKUPS)
+    : undefined;
 const SESSION_FILE = "/tmp/seed-child-lookup-session.txt";
 
 const stage = process.argv[2] ?? "start";
@@ -38,10 +52,7 @@ async function main() {
       object: OBJECT,
       whereClause: WHERE,
       sampleSize: 25,
-      childLookups: {
-        Opportunity: ["Pricebook2Id"],
-        hed__Application__c: ["hed__Applying_To__c"],
-      },
+      childLookups: CHILD_LOOKUPS,
     });
     writeFileSync(SESSION_FILE, resp.sessionId);
   } else if (stage === "analyze") {
@@ -51,11 +62,16 @@ async function main() {
       includeManagedPackages: true,
     });
   } else if (stage === "select") {
+    // SEED_INCLUDE_CHILDREN — comma-separated object names to include as optional children.
+    const childList =
+      process.env.SEED_INCLUDE_CHILDREN !== undefined
+        ? process.env.SEED_INCLUDE_CHILDREN.split(",").map((s) => s.trim()).filter(Boolean)
+        : [];
     resp = await seed({
       action: "select",
       sessionId: sessionId,
       includeOptionalParents: [],
-      includeOptionalChildren: ["Opportunity", "hed__Application__c"],
+      includeOptionalChildren: childList,
     });
   } else if (stage === "dry_run") {
     resp = await seed({ action: "dry_run", sessionId: sessionId });
