@@ -112,6 +112,36 @@ If you find a path where record data flows through the MCP envelope, that's a se
 - **Not a guarantee about the source org.** This tool can't stop you from running other queries through other tools. It only guarantees that *its own* tool calls don't expose row data to the AI.
 - **Not a bypass for least-privilege auth.** If your Salesforce user can see the data, the tool can extract it. Use a scoped integration user when seeding.
 - **Not a substitute for masking.** The data on disk is real. If you load it into a sandbox, the sandbox now contains real data. Sandboxes generally have weaker access controls than prod — plan for that. PII masking is on the roadmap.
+- **Not immune to out-of-band target deletions.** The persistent project id-map at `~/.sandbox-seed/id-maps/` caches source→target ID pairs across runs. If a target row is deleted outside this tool (manual cleanup, another data loader, a partial sandbox refresh the tool didn't observe), the map still claims the row exists and the next run that FKs to it will fail with `INVALID_CROSS_REFERENCE_KEY`. When this happens, `execute.log` flags the specific stale entries and suggests re-running with `isolateIdMap: true` once to rebuild the map from scratch.
+
+---
+
+## What's on disk
+
+The boundary keeps record data out of the AI's context window. It does **not** encrypt anything on your workstation. Every artifact below is plain JSON / plain text, readable by any process running as you.
+
+| Path | Contains | Scope |
+|---|---|---|
+| `~/.sandbox-seed/sessions/<sessionId>/extract/*.json` | full source records for objects in scope (every field the tool queried) | per-session; GC'd after 7 days |
+| `~/.sandbox-seed/sessions/<sessionId>/id-map.json` | source→target ID pairs produced by this session | per-session; GC'd after 7 days |
+| `~/.sandbox-seed/sessions/<sessionId>/execute.log` | per-row insert/upsert results, source IDs, Salesforce error messages | per-session; GC'd after 7 days |
+| `~/.sandbox-seed/sessions/<sessionId>/dry-run.md` | plan details including record IDs and SOQL | per-session; GC'd after 7 days |
+| `~/.sandbox-seed/id-maps/<source>__<target>.json` | source→target ID pairs accumulated across runs | persistent; per (sourceAlias, targetAlias) pair |
+| `.sandbox-seeding/cache/describe/` | sObject schema metadata (no record data) | persistent; repo-root by default, TTL 24h |
+
+Session GC runs at 7 days by default. To clear everything end-of-engagement:
+
+```bash
+rm -rf ~/.sandbox-seed/sessions ~/.sandbox-seed/id-maps
+```
+
+To clear only the describe cache:
+
+```bash
+rm -rf .sandbox-seeding/cache
+```
+
+Files inherit the default umask — the tool does not force `0700`. If you run on a shared workstation, set a restrictive umask (`umask 077`) before invocation.
 
 ---
 
