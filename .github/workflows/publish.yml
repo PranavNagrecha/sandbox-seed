@@ -21,8 +21,11 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           registry-url: 'https://registry.npmjs.org'
+
+      # npm >=11.5.1 is required for Trusted Publisher OIDC.
+      - run: npm install -g npm@latest
 
       - run: npm ci
       # TODO: re-enable `npm run lint` once Biome errors are cleaned up.
@@ -31,5 +34,3 @@ jobs:
       - run: npm run build
 
       - run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NODE_AUTH_TOKEN }}
