@@ -1,0 +1,82 @@
+{
+  "name": "sandbox-seed",
+  "version": "0.1.0",
+  "description": "Salesforce sandbox seeding CLI and MCP server — SOQL-driven org-to-org migration, synthetic data generation, and deterministic masking. AI-safe by construction: record data never leaves your machine.",
+  "license": "Apache-2.0",
+  "author": "Pranav Nagrecha",
+  "homepage": "https://github.com/PranavNagrecha/sandbox-seed#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PranavNagrecha/sandbox-seed.git"
+  },
+  "bugs": {
+    "url": "https://github.com/PranavNagrecha/sandbox-seed/issues"
+  },
+  "keywords": [
+    "salesforce",
+    "sandbox",
+    "seeding",
+    "soql",
+    "mcp",
+    "model-context-protocol",
+    "data-migration",
+    "sfdx"
+  ],
+  "type": "module",
+  "bin": {
+    "sandbox-seed": "./bin/run.js",
+    "sandbox-seed-mcp": "./bin/mcp.js"
+  },
+  "files": [
+    "bin",
+    "dist",
+    "oclif.manifest.json"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf dist oclif.manifest.json",
+    "prepack": "npm run clean && npm run build && oclif manifest",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "biome check src tests",
+    "lint:fix": "biome check --write src tests",
+    "inspect:dev": "node --experimental-strip-types bin/dev.ts inspect",
+    "mcp:dev": "node --experimental-strip-types bin/mcp-dev.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@oclif/core": "^4.0.0",
+    "graphology": "^0.25.4",
+    "graphology-dag": "^0.4.1",
+    "graphology-traversal": "^0.3.1",
+    "graphology-components": "^1.5.4",
+    "jsforce": "^3.1.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^1.9.0",
+    "@types/node": "^22.0.0",
+    "oclif": "^4.15.0",
+    "typescript": "^5.5.0",
+    "vitest": "^2.1.0"
+  },
+  "oclif": {
+    "bin": "sandbox-seed",
+    "dirname": "sandbox-seed",
+    "commands": "./dist/commands",
+    "topicSeparator": " ",
+    "exitCodes": {
+      "default": 1,
+      "failedFlagParsing": 1,
+      "failedFlagValidation": 1,
+      "invalidArgsSpec": 1,
+      "nonExistentFlag": 1,
+      "requiredArgs": 1,
+      "unexpectedArgs": 1
+    }
+  }
+}

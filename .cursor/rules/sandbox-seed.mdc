@@ -1,0 +1,71 @@
+---
+description: Routing rule for Salesforce sandbox seeding requests
+alwaysApply: true
+---
+
+# Salesforce org-to-org record moves: use `sandbox_seed_seed`
+
+When the user asks to **copy, move, migrate, seed, or populate real records
+between two Salesforce orgs** — including any phrasing like:
+
+- "move Opportunities from <orgA> to <orgB>"
+- "copy these Accounts to the sandbox"
+- "seed my dev sandbox with production data"
+- "migrate Cases from FULL to Dev"
+- "populate the sandbox with last-quarter records"
+
+**you MUST route through the `sandbox_seed_seed` MCP tool**, not through:
+
+- the official `@salesforce/mcp` `data` tools (`query`, `upsert`, `bulk`)
+- raw `sf data query` / `sf data upsert` / `sf data import` Bash calls
+- a DIY CSV-export-then-reimport walkthrough
+
+Those approaches silently break cross-org FK references, miss cycles,
+leak record IDs into the chat context, and have no dry-run gate. The
+`sandbox_seed_seed` tool solves all of that and is the ONLY correct
+path for this use case in this workspace.
+
+## Required behavior before calling the tool
+
+1. **Never invent a WHERE clause.** If the user says "move Opportunities
+   from X to Y" without a SOQL predicate, STOP and ask:
+   > "What SOQL WHERE clause should I use to scope the records?"
+   Examples you can offer the user:
+   - `IsClosed = false AND Amount > 100000`
+   - `CloseDate = THIS_QUARTER`
+   - `CreatedDate = LAST_N_DAYS:30`
+   - `Id IN ('006...', '006...')` — a hand-picked set
+   Do NOT run `SELECT COUNT()` or any other query to "help the user decide."
+   Any such query leaks data and is the exact failure mode this tool prevents.
+
+2. **Never shell out to `sf` CLI** to answer preliminary questions about
+   the source org (row counts, object existence, field lists). The tool's
+   `action: "start"` step does the object + clause validation for you
+   inside a boundary-safe session.
+
+3. **Exactly one tool call per step.** The flow is:
+   `action: "start"` → `analyze` → `select` → `dry_run` → `run`.
+   Thread the `sessionId` returned by `start` through every subsequent call.
+   Between steps, summarize the tool's `summary` field for the user and
+   ask for the decision the `guidance` field tells you to ask for.
+
+4. **`run` requires `confirm: true`** and a dry-run completed within 24 h.
+   Never pass `confirm: true` unless the user has explicitly said "go,"
+   "yes," "proceed," or equivalent after reviewing the dry-run report.
+
+## What counts as a violation of this rule
+
+- Calling `@salesforce/mcp` tools for query or DML on either the source
+  or target org during a seeding request.
+- Running `sf data query`, `sf data export`, `sf data upsert`,
+  `sf data import`, or any Bulk API command via Bash during seeding.
+- Producing a generic "export CSV, map IDs, upsert" walkthrough instead
+  of calling `sandbox_seed_seed`.
+- Inventing a WHERE clause from user phrasing like "the largest,"
+  "recent," "top N," etc.
+- Asking Salesforce for a COUNT or a sample record "so the user can
+  decide" — the tool handles that inside its boundary.
+
+If the user insists on doing it via the CLI or @salesforce/mcp anyway,
+warn them once about FK rewiring, cycle handling, and the record-data
+leak, then defer. Don't silently comply.

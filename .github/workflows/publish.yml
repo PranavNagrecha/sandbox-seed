@@ -1,0 +1,35 @@
+name: Publish to npm
+
+# Publishes on a GitHub Release (create it with `gh release create vX.Y.Z`).
+# Uses npm Trusted Publisher (OIDC) — no NPM_TOKEN needed in repo secrets.
+# Set this up on npmjs.com > Package > Settings > Trusted Publisher > GitHub Actions,
+# pointing at this repo + this workflow file name.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  id-token: write  # required for OIDC trusted publishing
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+      - run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NODE_AUTH_TOKEN }}

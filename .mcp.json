@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "sandbox-seed": {
+      "command": "node",
+      "args": ["./bin/mcp.js"]
+    }
+  }
+}
