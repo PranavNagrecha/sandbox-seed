@@ -24,13 +24,12 @@ jobs:
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'
 
-      # npm >=11.5.1 is required for Trusted Publisher OIDC.
-      - run: npm install -g npm@latest
-
       - run: npm ci
       # TODO: re-enable `npm run lint` once Biome errors are cleaned up.
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
 
-      - run: npm publish --provenance --access public
+      # npm >=11.5.1 is required for Trusted Publisher OIDC.
+      # Use npx to sidestep the self-upgrade `promise-retry` bug in npm CLI.
+      - run: npx -y npm@11.5.1 publish --provenance --access public
