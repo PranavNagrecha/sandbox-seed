@@ -127,6 +127,15 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteSummary> 
   let projectIdMapInvalidated: ExecuteSummary["projectIdMapInvalidated"];
   const alreadySeededCounts: Record<string, number> = {};
   let projectMapSizeBefore = 0;
+  // Target-ID → origin, populated only for entries loaded from the
+  // persistent project id-map. Used to self-diagnose
+  // INVALID_CROSS_REFERENCE_KEY insert failures: when the error fires on a
+  // row whose FK was resolved from the project map, the referenced target
+  // row has likely been deleted out-of-band and the map entry is stale.
+  const projectMapLoadedByTargetId = new Map<
+    string,
+    { object: string; sourceId: string }
+  >();
   if (
     opts.isolateIdMap !== true &&
     typeof opts.sourceAlias === "string" &&
@@ -156,6 +165,7 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteSummary> 
         const obj = k.slice(0, ix);
         const srcId = k.slice(ix + 1);
         idMap.set(obj, srcId, v);
+        projectMapLoadedByTargetId.set(v, { object: obj, sourceId: srcId });
       }
     }
   }
@@ -246,6 +256,7 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteSummary> 
           idMap,
           rootIds,
           appendLog,
+          projectMapLoadedByTargetId,
         });
         insertedCounts[object] = res.inserted;
         errorCount += res.errors;
@@ -265,6 +276,7 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteSummary> 
           rootIds,
           scopePaths,
           appendLog,
+          projectMapLoadedByTargetId,
         });
         for (const [o, n] of Object.entries(res.inserted)) {
           insertedCounts[o] = (insertedCounts[o] ?? 0) + n;
@@ -353,8 +365,18 @@ async function seedSingle(args: {
   idMap: IdMap;
   rootIds: string[];
   appendLog: (msg: string) => Promise<void>;
+  projectMapLoadedByTargetId: Map<string, { object: string; sourceId: string }>;
 }): Promise<{ inserted: number; errors: number; alreadySeeded: number }> {
-  const { object, scopes, opts, fetchFn, idMap, rootIds, appendLog } = args;
+  const {
+    object,
+    scopes,
+    opts,
+    fetchFn,
+    idMap,
+    rootIds,
+    appendLog,
+    projectMapLoadedByTargetId,
+  } = args;
 
   const srcDescribe = await opts.sourceDescribe.describeObject(object);
   const allCreateable = pickCreateableFields(srcDescribe);
@@ -494,6 +516,18 @@ async function seedSingle(args: {
           await appendLog(
             `${object}: upsert failed for sourceId=${sourceId} — ${JSON.stringify(r.errors ?? [])}`,
           );
+          if (hasInvalidCrossReference(r.errors)) {
+            const suspects = describeStaleProjectMapSuspects(
+              upsertRewrites[i].body,
+              projectMapLoadedByTargetId,
+            );
+            if (suspects.length > 0) {
+              await appendLog(
+                `${object}: ↳ likely stale project id-map entries (target row deleted out-of-band?): ${suspects.join("; ")}. ` +
+                  `Re-run with isolateIdMap:true once to rebuild.`,
+              );
+            }
+          }
         }
       }
     }
@@ -516,6 +550,18 @@ async function seedSingle(args: {
           await appendLog(
             `${object}: insert failed for sourceId=${sourceId} — ${JSON.stringify(r.errors ?? [])}`,
           );
+          if (hasInvalidCrossReference(r.errors)) {
+            const suspects = describeStaleProjectMapSuspects(
+              insertRewrites[i].body,
+              projectMapLoadedByTargetId,
+            );
+            if (suspects.length > 0) {
+              await appendLog(
+                `${object}: ↳ likely stale project id-map entries (target row deleted out-of-band?): ${suspects.join("; ")}. ` +
+                  `Re-run with isolateIdMap:true once to rebuild.`,
+              );
+            }
+          }
         }
       }
     }
@@ -540,8 +586,18 @@ async function seedCycle(args: {
   rootIds: string[];
   scopePaths: Map<string, ScopePath[]>;
   appendLog: (msg: string) => Promise<void>;
+  projectMapLoadedByTargetId: Map<string, { object: string; sourceId: string }>;
 }): Promise<{ inserted: Record<string, number>; errors: number }> {
-  const { step, opts, fetchFn, idMap, rootIds, scopePaths, appendLog } = args;
+  const {
+    step,
+    opts,
+    fetchFn,
+    idMap,
+    rootIds,
+    scopePaths,
+    appendLog,
+    projectMapLoadedByTargetId,
+  } = args;
 
   if (step.breakEdge === null) {
     await appendLog(`SKIP cycle ${step.objects.join(",")}: no nillable break edge available.`);
@@ -692,6 +748,18 @@ async function seedCycle(args: {
             await appendLog(
               `${object} [cycle phase 1]: upsert failed for sourceId=${sourceId} — ${JSON.stringify(r.errors ?? [])}`,
             );
+            if (hasInvalidCrossReference(r.errors)) {
+              const suspects = describeStaleProjectMapSuspects(
+                upsertRewrites[i].body,
+                projectMapLoadedByTargetId,
+              );
+              if (suspects.length > 0) {
+                await appendLog(
+                  `${object} [cycle phase 1]: ↳ likely stale project id-map entries (target row deleted out-of-band?): ${suspects.join("; ")}. ` +
+                    `Re-run with isolateIdMap:true once to rebuild.`,
+                );
+              }
+            }
           }
         }
       }
@@ -714,6 +782,18 @@ async function seedCycle(args: {
             await appendLog(
               `${object} [cycle phase 1]: insert failed for sourceId=${sourceId} — ${JSON.stringify(r.errors ?? [])}`,
             );
+            if (hasInvalidCrossReference(r.errors)) {
+              const suspects = describeStaleProjectMapSuspects(
+                insertRewrites[i].body,
+                projectMapLoadedByTargetId,
+              );
+              if (suspects.length > 0) {
+                await appendLog(
+                  `${object} [cycle phase 1]: ↳ likely stale project id-map entries (target row deleted out-of-band?): ${suspects.join("; ")}. ` +
+                    `Re-run with isolateIdMap:true once to rebuild.`,
+                );
+              }
+            }
           }
         }
       }
@@ -797,6 +877,59 @@ async function seedCycle(args: {
 // ────────────────────────────────────────────────────────────────────
 // Helpers
 // ────────────────────────────────────────────────────────────────────
+
+/**
+ * When a composite insert/upsert returns `INVALID_CROSS_REFERENCE_KEY`,
+ * inspect the rewritten row body for FK values whose target ID was seeded
+ * from a prior run (i.e. loaded from the persistent project id-map rather
+ * than produced by this run's inserts). Those are the concrete suspects
+ * for an out-of-band deletion on the target org — the map still claims the
+ * row exists, but the target doesn't have it anymore.
+ *
+ * Returns a compact list of `"field=<name> → projectMap[<object>:<srcId>]=<tgtId>"`
+ * strings, capped at 5, for inclusion in execute.log. Empty list ⇒ no
+ * suspects (e.g. the error came from a field resolved this run, or from a
+ * standard-root that was omitted entirely).
+ */
+function describeStaleProjectMapSuspects(
+  body: Record<string, unknown>,
+  projectMapLoadedByTargetId: Map<string, { object: string; sourceId: string }>,
+): string[] {
+  if (projectMapLoadedByTargetId.size === 0) return [];
+  const suspects: string[] = [];
+  for (const [key, value] of Object.entries(body)) {
+    if (key === "attributes") continue;
+    if (typeof value !== "string") continue;
+    const origin = projectMapLoadedByTargetId.get(value);
+    if (origin === undefined) continue;
+    suspects.push(
+      `${key}=projectMap[${origin.object}:${origin.sourceId}]→${value}`,
+    );
+    if (suspects.length >= 5) break;
+  }
+  return suspects;
+}
+
+/**
+ * Returns true if the composite error array contains a row-level
+ * `INVALID_CROSS_REFERENCE_KEY` status. Salesforce nests the code under
+ * `statusCode` (insert) or `errorCode` (upsert) depending on the endpoint;
+ * we accept either.
+ */
+function hasInvalidCrossReference(errs: unknown): boolean {
+  if (!Array.isArray(errs)) return false;
+  for (const e of errs) {
+    if (e === null || typeof e !== "object") continue;
+    const rec = e as Record<string, unknown>;
+    if (
+      rec.statusCode === "INVALID_CROSS_REFERENCE_KEY" ||
+      rec.errorCode === "INVALID_CROSS_REFERENCE_KEY"
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
 
 /**
  * Populate the id-map with source→target mappings for standard-root objects
