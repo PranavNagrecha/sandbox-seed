@@ -249,8 +249,12 @@ function findParentChain(
 }
 
 /**
- * Chunk an ID list for SOQL `Id IN (...)` clauses. SOQL has a hard limit
- * around 4000 elements; we stay well below.
+ * Chunk an ID list for SOQL `Id IN (...)` clauses.
+ *
+ * SOQL's hard `IN (...)` ceiling is ~4000 elements, but the practical bound
+ * is URL length — 18-char IDs + quoting + the rest of the query easily
+ * exceed Salesforce's ~16k request-URI limit well before 4000 IDs. 500 keeps
+ * us comfortably under both on any realistic WHERE clause.
  */
 export function chunkIds<T>(ids: T[], chunkSize = 500): T[][] {
   if (ids.length === 0) return [];

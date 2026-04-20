@@ -75,30 +75,18 @@ export function computeLoadOrder(graph: DependencyGraph, opts: OrderOptions): Lo
     }
   }
 
-  // Kahn's: in-degree tracking on the condensation.
-  const inDeg = new Map<ComponentId, number>();
-  for (const c of components) inDeg.set(c, 0);
-  for (const [, targets] of condEdges) {
-    for (const t of targets) {
-      inDeg.set(t, (inDeg.get(t) ?? 0) + 1);
-    }
-  }
-
-  // Dependencies: for X to be loaded, every component it depends on (i.e. points TO) must be loaded first.
-  // Our edge semantics: source references target (target must exist first, since source has a FK to it).
-  // So topo order is: components with no outgoing dependencies first. Equivalently, Kahn's with edges REVERSED.
+  // Kahn's over the REVERSED condensation.
   //
-  // Re-derive with reversed semantics:
+  // Edge semantics: source references target; target must exist before source
+  // can be inserted. So topo order is: components with no outgoing edges first.
+  // Equivalent formulation — reverse the edges (target → source), then Kahn's:
+  // in-degree of `src` in the reversed graph = its out-degree in the original
+  // = number of distinct components it depends on.
   const revInDeg = new Map<ComponentId, number>();
   for (const c of components) revInDeg.set(c, 0);
   for (const [src, targets] of condEdges) {
-    // In original direction, src points to target. In reversed graph, target points to src.
-    // So reversed in-degree of src = number of targets src points to.
     revInDeg.set(src, (revInDeg.get(src) ?? 0) + targets.size);
-    void src;
   }
-  // Actually simpler: in the reversed graph, edges go target → src. In-degree of a node in the reversed
-  // graph = its out-degree in the original = number of distinct components it depends on.
 
   // Build reversed adjacency for Kahn.
   const revAdj = new Map<ComponentId, Set<ComponentId>>();
