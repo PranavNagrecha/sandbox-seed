@@ -450,7 +450,12 @@ async function seedSingle(args: {
   }
   const records = [...byId.values()];
   if (records.length === 0) {
-    await appendLog(`SKIP ${object}: no records returned by any scope path.`);
+    await appendLog(
+      `SKIP ${object}: 0 source records fetched across ${scopes.length} path(s). ` +
+        `Common causes: (a) none of the in-scope root records actually relate to ${object} via the available FK path; ` +
+        `(b) the only path to ${object} is transitive (>1 hop from root) and not materialized yet; ` +
+        `(c) the scope SOQL ran but matched zero — check the corresponding entry in dry-run.md.`,
+    );
     return { inserted: 0, errors: 0, alreadySeeded: 0 };
   }
   await appendLog(`${object}: total unique source record(s) across paths: ${records.length}.`);
@@ -675,6 +680,21 @@ async function seedCycle(args: {
         rootIds,
         sampleApplied: opts.sampledRootIds !== undefined,
       });
+      if (soqls.length === 0) {
+        // Surface the silent skip — seedSingle already logs this; the
+        // cycle path used to swallow it which read as "0 records, no
+        // error" in the run log. Most common cause is a transitive
+        // scope path (object reached via 2+ FK hops from the root)
+        // which composeScopeSoqls doesn't materialize yet.
+        const hint =
+          scope.kind === "transitive"
+            ? " — multi-hop scope paths are not materialized yet; include the intermediate parent on `select` or restructure the root"
+            : "";
+        await appendLog(
+          `${object} [cycle phase 1]: skipping path kind=${scope.kind} (unable to compose SOQL${hint}).`,
+        );
+        continue;
+      }
       for (const soql of soqls) {
         const subRecords = await queryRecords({ auth: opts.sourceAuth, soql, fetchFn });
         for (const r of subRecords) {
@@ -687,6 +707,18 @@ async function seedCycle(args: {
     await appendLog(
       `${object} [cycle phase 1]: unioned ${records.length} source record(s) across ${paths.length} path(s).`,
     );
+    if (records.length === 0) {
+      // Every object in finalObjectList was either auto-required or
+      // explicitly picked by the user — a 0-record outcome here is
+      // almost always a surprise. Spell out the likely causes so the
+      // log is self-diagnostic.
+      await appendLog(
+        `WARN ${object} [cycle phase 1]: 0 source records fetched. ` +
+          `Common causes: (a) none of the in-scope root records actually relate to ${object} via the available FK path; ` +
+          `(b) the only path to ${object} is transitive (>1 hop from root) and not materialized yet; ` +
+          `(c) the scope SOQL ran but matched zero — check the corresponding entry in dry-run.md.`,
+      );
+    }
 
     const perIdMap = new Map<string, Record<string, unknown>>();
     for (const r of records) {
@@ -1171,8 +1203,25 @@ function composeScopeSoqls(args: {
 }): string[] {
   const fieldList = args.fields.join(", ");
   switch (args.scope.kind) {
-    case "root":
+    case "root": {
+      // When sampleSize was applied at start, `rootIds` is exactly the
+      // sampled set. The user's WHERE clause alone would re-evaluate
+      // server-side and fetch every matching row — blowing the sample
+      // contract and pulling in records the dry-run never reviewed. Use
+      // `Id IN (chunked rootIds)` so we extract exactly the sample.
+      // Unsampled runs keep the simple WHERE form (rootIds = all
+      // matching rows, so the two predicates are equivalent).
+      if (args.sampleApplied === true && args.rootIds.length > 0) {
+        const out: string[] = [];
+        for (const chunk of chunkIds(args.rootIds, ROOT_ID_CHUNK)) {
+          out.push(
+            `SELECT ${fieldList} FROM ${args.object} WHERE Id IN (${soqlIdList(chunk)})`,
+          );
+        }
+        return out;
+      }
       return [`SELECT ${fieldList} FROM ${args.object} WHERE ${args.whereClause}`];
+    }
     case "direct-parent": {
       if (args.scope.rootFk === undefined) return [];
       if (args.rootIds.length === 0) return [];
