@@ -15,7 +15,7 @@ export function buildServer(): McpServer {
   const server = new McpServer(
     {
       name: "sandbox-seed",
-      version: "0.2.5",
+      version: "0.2.6",
     },
     {
       instructions:
