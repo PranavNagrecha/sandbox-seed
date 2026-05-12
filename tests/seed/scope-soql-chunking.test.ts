@@ -37,7 +37,7 @@ function countOccurrences(haystack: string, needle: string): number {
 }
 
 describe("composeScopeSoqls — root scope", () => {
-  it("emits a single query carrying the user WHERE clause verbatim", () => {
+  it("emits a single query carrying the user WHERE clause verbatim when unsampled", () => {
     const scope: ScopePath = { object: "Account", kind: "root" };
     const soqls = _composeScopeSoqls({
       scope,
@@ -48,6 +48,51 @@ describe("composeScopeSoqls — root scope", () => {
       rootIds: [],
     });
     expect(soqls).toEqual(["SELECT Id, Name FROM Account WHERE Industry = 'Education'"]);
+  });
+
+  it("switches to Id IN (chunked rootIds) when sampleApplied (issue #5)", () => {
+    // Bug: at sampleSize=100, the root path used to re-run the user's
+    // WHERE clause, which fetches all 2,566 matching rows instead of
+    // just the 100 sampled — inflating run errors and inserting
+    // unintended records the dry-run never reviewed.
+    const scope: ScopePath = { object: "Account", kind: "root" };
+    const rootIds = ids(350); // 350 / 200 = 2 chunks
+    const soqls = _composeScopeSoqls({
+      scope,
+      object: "Account",
+      fields: ["Id", "Name"],
+      rootObject: "Account",
+      whereClause: "Industry = 'Education'",
+      rootIds,
+      sampleApplied: true,
+    });
+    expect(soqls).toHaveLength(2);
+    for (const s of soqls) {
+      // No longer re-runs WHERE — uses literal IN list.
+      expect(s).not.toContain("Industry = 'Education'");
+      expect(s).toMatch(/^SELECT Id, Name FROM Account WHERE Id IN \('00Q[^)]+\)$/);
+    }
+    // All sampled IDs accounted for, exactly once across the chunks.
+    const combined = soqls.join("\n");
+    for (const id of rootIds) {
+      expect(countOccurrences(combined, `'${id}'`)).toBe(1);
+    }
+  });
+
+  it("ignores sampleApplied when rootIds is empty (falls back to WHERE)", () => {
+    // Defensive: sampleApplied without a materialized set is meaningless;
+    // shouldn't crash, should fall through to the historic shape.
+    const scope: ScopePath = { object: "Account", kind: "root" };
+    const soqls = _composeScopeSoqls({
+      scope,
+      object: "Account",
+      fields: ["Id"],
+      rootObject: "Account",
+      whereClause: "Name != null",
+      rootIds: [],
+      sampleApplied: true,
+    });
+    expect(soqls).toEqual(["SELECT Id FROM Account WHERE Name != null"]);
   });
 });
 
