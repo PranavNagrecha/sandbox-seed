@@ -249,12 +249,28 @@ function findParentChain(
 }
 
 /**
+ * Default chunk size for embedding IDs in a SOQL `Id IN (...)` predicate
+ * that will be issued via Salesforce's GET `/query` endpoint.
+ *
+ * `/query` accepts URIs up to ~16 KB. An 18-char ID with URL-encoded
+ * quoting + comma is ~26 chars; 200 IDs ≈ 5 KB of IN list, leaving
+ * comfortable headroom for the outer SOQL and the user's WHERE clause.
+ *
+ * Used by callers that compose SOQL with `IN (rootIds)` (or any other
+ * caller-supplied ID list) and need to chunk the request to stay under
+ * the URI limit.
+ */
+export const ROOT_ID_CHUNK = 200;
+
+/**
  * Chunk an ID list for SOQL `Id IN (...)` clauses.
  *
  * SOQL's hard `IN (...)` ceiling is ~4000 elements, but the practical bound
  * is URL length — 18-char IDs + quoting + the rest of the query easily
- * exceed Salesforce's ~16k request-URI limit well before 4000 IDs. 500 keeps
- * us comfortably under both on any realistic WHERE clause.
+ * exceed Salesforce's ~16k request-URI limit well before 4000 IDs. The
+ * default `chunkSize` here (500) is sized for non-URL contexts (e.g. the
+ * `composite/sobjects` batch limit). Callers that build `IN` lists for
+ * GET `/query` should pass `ROOT_ID_CHUNK` instead.
  */
 export function chunkIds<T>(ids: T[], chunkSize = 500): T[][] {
   if (ids.length === 0) return [];

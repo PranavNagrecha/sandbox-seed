@@ -10,6 +10,7 @@ import type { LoadPlan, LoadStep } from "../graph/order.ts";
 import { isStandardRootObject } from "../graph/standard-objects.ts";
 import { salesforceFetch } from "../salesforce-fetch.ts";
 import {
+  ROOT_ID_CHUNK,
   type ScopePath,
   chunkIds,
   computeScopePaths,
@@ -80,7 +81,7 @@ export type ExecuteOptions = {
   upsertDecisions?: Record<string, UpsertDecisionSummary>;
   /**
    * User-selected "Child + 1" lookups. Forwarded to computeScopePaths and
-   * composeScopeSoql so lookup-target objects get a resolvable scope.
+   * composeScopeSoqls so lookup-target objects get a resolvable scope.
    * See src/seed/extract.ts ScopePath kind="child-lookup".
    */
   childLookups?: Record<string, string[]>;
@@ -103,6 +104,17 @@ export type ExecuteOptions = {
    * id-map.json is still written either way.
    */
   isolateIdMap?: boolean;
+  /**
+   * Pre-materialized root IDs from `start`-time sampling. When present,
+   * `runExecute` uses these as the root scope verbatim and skips the
+   * root SOQL altogether — `whereClause` then alone is too coarse to
+   * reproduce the sample, so callers MUST thread these in to honor
+   * `sampleSize`. Also disables the >2000-IDs direct-child subquery
+   * shortcut in `composeScopeSoqls`, since that shortcut re-evaluates
+   * the WHERE clause server-side and would over-fetch beyond the
+   * sample.
+   */
+  sampledRootIds?: string[];
 };
 
 const BATCH_SIZE = 200;
@@ -132,10 +144,7 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteSummary> 
   // INVALID_CROSS_REFERENCE_KEY insert failures: when the error fires on a
   // row whose FK was resolved from the project map, the referenced target
   // row has likely been deleted out-of-band and the map entry is stale.
-  const projectMapLoadedByTargetId = new Map<
-    string,
-    { object: string; sourceId: string }
-  >();
+  const projectMapLoadedByTargetId = new Map<string, { object: string; sourceId: string }>();
   if (
     opts.isolateIdMap !== true &&
     typeof opts.sourceAlias === "string" &&
@@ -206,15 +215,27 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteSummary> 
   });
 
   // Materialize root scope IDs; every downstream scope is derived from these.
-  const rootIds = await queryIds({
-    auth: opts.sourceAuth,
-    soql: `SELECT Id FROM ${opts.rootObject} WHERE ${opts.whereClause}`,
-    fetchFn,
-  });
+  // When the session was started with `sampleSize`, the sampled IDs are
+  // already materialized — use them verbatim and skip the SOQL hit. This
+  // is both an optimization and the only correct path: we deliberately
+  // do NOT bake the sample into `whereClause` anymore (issue #1) so the
+  // root SOQL alone can't reproduce it.
+  const rootIds =
+    opts.sampledRootIds !== undefined && opts.sampledRootIds.length > 0
+      ? [...opts.sampledRootIds]
+      : await queryIds({
+          auth: opts.sourceAuth,
+          soql: `SELECT Id FROM ${opts.rootObject} WHERE ${opts.whereClause}`,
+          fetchFn,
+        });
   if (rootIds.length === 0) {
     throw new UserError(`WHERE clause returned 0 records on ${opts.rootObject}. Nothing to seed.`);
   }
-  await appendLog(`Root scope: ${rootIds.length} ${opts.rootObject} record(s).`);
+  await appendLog(
+    `Root scope: ${rootIds.length} ${opts.rootObject} record(s)${
+      opts.sampledRootIds !== undefined ? " (from sampleSize at start)" : ""
+    }.`,
+  );
 
   // Optional: snapshot + deactivate target-org validation rules scoped
   // to finalObjectList. Done AFTER root-scope materialization so we
@@ -367,16 +388,8 @@ async function seedSingle(args: {
   appendLog: (msg: string) => Promise<void>;
   projectMapLoadedByTargetId: Map<string, { object: string; sourceId: string }>;
 }): Promise<{ inserted: number; errors: number; alreadySeeded: number }> {
-  const {
-    object,
-    scopes,
-    opts,
-    fetchFn,
-    idMap,
-    rootIds,
-    appendLog,
-    projectMapLoadedByTargetId,
-  } = args;
+  const { object, scopes, opts, fetchFn, idMap, rootIds, appendLog, projectMapLoadedByTargetId } =
+    args;
 
   const srcDescribe = await opts.sourceDescribe.describeObject(object);
   const allCreateable = pickCreateableFields(srcDescribe);
@@ -399,31 +412,40 @@ async function seedSingle(args: {
   }
 
   // Union records across every applicable path, deduping by Id.
+  // Each scope path may compose into multiple SOQL queries when rootIds
+  // is large enough to bust Salesforce's URI limit (see composeScopeSoqls).
+  const sampleApplied = opts.sampledRootIds !== undefined;
   const byId = new Map<string, Record<string, unknown>>();
   for (const scope of scopes) {
-    const soql = composeScopeSoql({
+    const soqls = composeScopeSoqls({
       scope,
       object,
       fields: ["Id", ...createable.map((f) => f.name)],
       rootObject: opts.rootObject,
       whereClause: opts.whereClause,
       rootIds,
+      sampleApplied,
     });
-    if (soql === null) {
+    if (soqls.length === 0) {
       await appendLog(`${object}: skipping path kind=${scope.kind} (unable to compose SOQL).`);
       continue;
     }
-    const subRecords = await queryRecords({
-      auth: opts.sourceAuth,
-      soql,
-      fetchFn,
-    });
-    for (const r of subRecords) {
-      const id = (r as { Id?: unknown }).Id;
-      if (typeof id === "string") byId.set(id, r);
+    let pathFetched = 0;
+    for (const soql of soqls) {
+      const subRecords = await queryRecords({
+        auth: opts.sourceAuth,
+        soql,
+        fetchFn,
+      });
+      pathFetched += subRecords.length;
+      for (const r of subRecords) {
+        const id = (r as { Id?: unknown }).Id;
+        if (typeof id === "string") byId.set(id, r);
+      }
     }
+    const chunkNote = soqls.length > 1 ? ` across ${soqls.length} chunk(s)` : "";
     await appendLog(
-      `${object}: path kind=${scope.kind} fetched ${subRecords.length} record(s) (union now ${byId.size}).`,
+      `${object}: path kind=${scope.kind} fetched ${pathFetched} record(s)${chunkNote} (union now ${byId.size}).`,
     );
   }
   const records = [...byId.values()];
@@ -545,22 +567,37 @@ async function seedSingle(args: {
         if (r.success && typeof r.id === "string" && sourceId.length > 0) {
           idMap.set(object, sourceId, r.id);
           inserted++;
-        } else {
-          errors++;
+          continue;
+        }
+        // DUPLICATE_VALUE recovery: when an INSERT collides with an
+        // existing target row on a uniqueness constraint, Salesforce
+        // returns the existing target ID in the error message. We pull
+        // it out, stitch a source→target mapping into the id-map, and
+        // count the row as already-seeded rather than failing the run.
+        // Downstream FK rewrites on later objects then resolve cleanly.
+        const recoveredId = extractDuplicateValueTargetId(r.errors);
+        if (recoveredId !== null && sourceId.length > 0) {
+          idMap.set(object, sourceId, recoveredId);
+          alreadySeeded++;
           await appendLog(
-            `${object}: insert failed for sourceId=${sourceId} — ${JSON.stringify(r.errors ?? [])}`,
+            `${object}: DUPLICATE_VALUE on sourceId=${sourceId} → recovered target id from error and stitched into id-map (treated as already-seeded).`,
           );
-          if (hasInvalidCrossReference(r.errors)) {
-            const suspects = describeStaleProjectMapSuspects(
-              insertRewrites[i].body,
-              projectMapLoadedByTargetId,
+          continue;
+        }
+        errors++;
+        await appendLog(
+          `${object}: insert failed for sourceId=${sourceId} — ${JSON.stringify(r.errors ?? [])}`,
+        );
+        if (hasInvalidCrossReference(r.errors)) {
+          const suspects = describeStaleProjectMapSuspects(
+            insertRewrites[i].body,
+            projectMapLoadedByTargetId,
+          );
+          if (suspects.length > 0) {
+            await appendLog(
+              `${object}: ↳ likely stale project id-map entries (target row deleted out-of-band?): ${suspects.join("; ")}. ` +
+                `Re-run with isolateIdMap:true once to rebuild.`,
             );
-            if (suspects.length > 0) {
-              await appendLog(
-                `${object}: ↳ likely stale project id-map entries (target row deleted out-of-band?): ${suspects.join("; ")}. ` +
-                  `Re-run with isolateIdMap:true once to rebuild.`,
-              );
-            }
           }
         }
       }
@@ -588,16 +625,8 @@ async function seedCycle(args: {
   appendLog: (msg: string) => Promise<void>;
   projectMapLoadedByTargetId: Map<string, { object: string; sourceId: string }>;
 }): Promise<{ inserted: Record<string, number>; errors: number }> {
-  const {
-    step,
-    opts,
-    fetchFn,
-    idMap,
-    rootIds,
-    scopePaths,
-    appendLog,
-    projectMapLoadedByTargetId,
-  } = args;
+  const { step, opts, fetchFn, idMap, rootIds, scopePaths, appendLog, projectMapLoadedByTargetId } =
+    args;
 
   if (step.breakEdge === null) {
     await appendLog(`SKIP cycle ${step.objects.join(",")}: no nillable break edge available.`);
@@ -637,19 +666,21 @@ async function seedCycle(args: {
     }
     const byId = new Map<string, Record<string, unknown>>();
     for (const scope of paths) {
-      const soql = composeScopeSoql({
+      const soqls = composeScopeSoqls({
         scope,
         object,
         fields: ["Id", ...createable.map((f) => f.name)],
         rootObject: opts.rootObject,
         whereClause: opts.whereClause,
         rootIds,
+        sampleApplied: opts.sampledRootIds !== undefined,
       });
-      if (soql === null) continue;
-      const subRecords = await queryRecords({ auth: opts.sourceAuth, soql, fetchFn });
-      for (const r of subRecords) {
-        const id = (r as { Id?: unknown }).Id;
-        if (typeof id === "string") byId.set(id, r);
+      for (const soql of soqls) {
+        const subRecords = await queryRecords({ auth: opts.sourceAuth, soql, fetchFn });
+        for (const r of subRecords) {
+          const id = (r as { Id?: unknown }).Id;
+          if (typeof id === "string") byId.set(id, r);
+        }
       }
     }
     const records = [...byId.values()];
@@ -777,22 +808,30 @@ async function seedCycle(args: {
           if (r.success && typeof r.id === "string" && sourceId.length > 0) {
             idMap.set(object, sourceId, r.id);
             objectInserted++;
-          } else {
-            errors++;
+            continue;
+          }
+          const recoveredId = extractDuplicateValueTargetId(r.errors);
+          if (recoveredId !== null && sourceId.length > 0) {
+            idMap.set(object, sourceId, recoveredId);
             await appendLog(
-              `${object} [cycle phase 1]: insert failed for sourceId=${sourceId} — ${JSON.stringify(r.errors ?? [])}`,
+              `${object} [cycle phase 1]: DUPLICATE_VALUE on sourceId=${sourceId} → recovered target id from error and stitched into id-map (treated as already-seeded).`,
             );
-            if (hasInvalidCrossReference(r.errors)) {
-              const suspects = describeStaleProjectMapSuspects(
-                insertRewrites[i].body,
-                projectMapLoadedByTargetId,
+            continue;
+          }
+          errors++;
+          await appendLog(
+            `${object} [cycle phase 1]: insert failed for sourceId=${sourceId} — ${JSON.stringify(r.errors ?? [])}`,
+          );
+          if (hasInvalidCrossReference(r.errors)) {
+            const suspects = describeStaleProjectMapSuspects(
+              insertRewrites[i].body,
+              projectMapLoadedByTargetId,
+            );
+            if (suspects.length > 0) {
+              await appendLog(
+                `${object} [cycle phase 1]: ↳ likely stale project id-map entries (target row deleted out-of-band?): ${suspects.join("; ")}. ` +
+                  `Re-run with isolateIdMap:true once to rebuild.`,
               );
-              if (suspects.length > 0) {
-                await appendLog(
-                  `${object} [cycle phase 1]: ↳ likely stale project id-map entries (target row deleted out-of-band?): ${suspects.join("; ")}. ` +
-                    `Re-run with isolateIdMap:true once to rebuild.`,
-                );
-              }
             }
           }
         }
@@ -902,9 +941,7 @@ function describeStaleProjectMapSuspects(
     if (typeof value !== "string") continue;
     const origin = projectMapLoadedByTargetId.get(value);
     if (origin === undefined) continue;
-    suspects.push(
-      `${key}=projectMap[${origin.object}:${origin.sourceId}]→${value}`,
-    );
+    suspects.push(`${key}=projectMap[${origin.object}:${origin.sourceId}]→${value}`);
     if (suspects.length >= 5) break;
   }
   return suspects;
@@ -929,6 +966,40 @@ function hasInvalidCrossReference(errs: unknown): boolean {
     }
   }
   return false;
+}
+
+/**
+ * Parse the existing-target ID out of a Salesforce DUPLICATE_VALUE error.
+ *
+ * Salesforce returns DUPLICATE_VALUE on a uniqueness-constrained INSERT
+ * with a message of the form:
+ *
+ *   "duplicate value found: <FieldApiName> duplicates value on record
+ *    with id: <15-or-18-char-id>"
+ *
+ * We extract that id so callers can write a source→target mapping into
+ * the id-map and treat the row as already-seeded. Conservative: only
+ * matches the documented message shape — if Salesforce changes the
+ * wording, we fall back to counting it as an error (no silent data
+ * loss). Returns null when no DUPLICATE_VALUE entry is present OR when
+ * the ID couldn't be parsed.
+ *
+ * Exported for unit testing.
+ */
+export function extractDuplicateValueTargetId(errs: unknown): string | null {
+  if (!Array.isArray(errs)) return null;
+  for (const e of errs) {
+    if (e === null || typeof e !== "object") continue;
+    const rec = e as Record<string, unknown>;
+    const code = rec.statusCode ?? rec.errorCode;
+    if (code !== "DUPLICATE_VALUE") continue;
+    const message = typeof rec.message === "string" ? rec.message : "";
+    // Prefer the 18-char form when present (Salesforce REST responses
+    // usually return 18), fall back to the 15-char canonical form.
+    const m = message.match(/\bid:\s*([a-zA-Z0-9]{18}|[a-zA-Z0-9]{15})\b/);
+    if (m !== null) return m[1];
+  }
+  return null;
 }
 
 /**
@@ -1072,65 +1143,99 @@ function pickCreateableFields(describe: SObjectDescribe): Field[] {
 }
 
 /**
- * Compose a `SELECT <fields> FROM <object>` with a WHERE clause appropriate
- * to how this object relates to the root (direct parent / direct child /
- * root itself). Returns null if the path is unknown or transitive (v1
- * doesn't materialize full transitive chains).
+ * Compose one or more `SELECT <fields> FROM <object>` queries with a WHERE
+ * clause appropriate to how this object relates to the root. Returns
+ * multiple queries when the root-ID list is large enough that a single
+ * `IN (...)` clause would push the GET `/query` URL over Salesforce's
+ * ~16 KB URI limit. Callers iterate and union the resulting records
+ * (dedup by Id — chunks from `chunkIds` are disjoint, but the dedup is
+ * defensive against future caller changes).
+ *
+ * Returns an empty array when the scope is unresolvable (unknown path,
+ * transitive chain not yet materialized, or required path fields absent).
  */
-function composeScopeSoql(args: {
+function composeScopeSoqls(args: {
   scope: ScopePath;
   object: string;
   fields: string[];
   rootObject: string;
   whereClause: string;
   rootIds: string[];
-}): string | null {
+  /**
+   * When true (sampleSize was applied at start), force chunked IN-list
+   * SOQL for the direct-child case even when `rootIds.length > 2000`.
+   * The subquery shortcut otherwise used at that size re-runs the
+   * user's WHERE clause server-side, which over-fetches past the sample.
+   */
+  sampleApplied?: boolean;
+}): string[] {
   const fieldList = args.fields.join(", ");
   switch (args.scope.kind) {
     case "root":
-      return `SELECT ${fieldList} FROM ${args.object} WHERE ${args.whereClause}`;
+      return [`SELECT ${fieldList} FROM ${args.object} WHERE ${args.whereClause}`];
     case "direct-parent": {
-      if (args.scope.rootFk === undefined) return null;
+      if (args.scope.rootFk === undefined) return [];
+      if (args.rootIds.length === 0) return [];
       // Materialize root IDs to avoid nested semi-join when the user's
       // WHERE already contains one (Salesforce forbids 2+ levels).
-      const idList = soqlIdList(args.rootIds);
-      if (idList.length === 0) return null;
-      return (
-        `SELECT ${fieldList} FROM ${args.object} ` +
-        `WHERE Id IN (SELECT ${args.scope.rootFk} FROM ${args.rootObject} WHERE Id IN (${idList}))`
-      );
+      // Chunked so a 500-ID root scope doesn't 414 the GET /query URL.
+      const out: string[] = [];
+      for (const chunk of chunkIds(args.rootIds, ROOT_ID_CHUNK)) {
+        const idList = soqlIdList(chunk);
+        out.push(
+          `SELECT ${fieldList} FROM ${args.object} ` +
+            `WHERE Id IN (SELECT ${args.scope.rootFk} FROM ${args.rootObject} WHERE Id IN (${idList}))`,
+        );
+      }
+      return out;
     }
     case "direct-child": {
-      if (args.scope.childFk === undefined) return null;
-      // Prefer a subquery over materialized IDs — shorter HTTP payload.
-      if (args.rootIds.length <= 2000) {
-        const idList = soqlIdList(args.rootIds);
-        if (idList.length === 0) return null;
-        return `SELECT ${fieldList} FROM ${args.object} WHERE ${args.scope.childFk} IN (${idList})`;
+      if (args.scope.childFk === undefined) return [];
+      if (args.rootIds.length === 0) return [];
+      // At very large root scopes we'd normally prefer the subquery form
+      // (single HTTP call, no IDs in URL). The semi-join sits on a
+      // single object, so Salesforce's "one semi-join only" rule is
+      // satisfied. BUT: when sampleSize is applied at start we can't
+      // use this shortcut — its inner `WHERE ${whereClause}` re-runs
+      // the user's predicate server-side and pulls in non-sampled rows,
+      // breaking the sample contract. Fall through to chunked IN-list.
+      if (args.rootIds.length > 2000 && args.sampleApplied !== true) {
+        return [
+          `SELECT ${fieldList} FROM ${args.object} ` +
+            `WHERE ${args.scope.childFk} IN (SELECT Id FROM ${args.rootObject} WHERE ${args.whereClause})`,
+        ];
       }
-      return (
-        `SELECT ${fieldList} FROM ${args.object} ` +
-        `WHERE ${args.scope.childFk} IN (SELECT Id FROM ${args.rootObject} WHERE ${args.whereClause})`
-      );
+      const out: string[] = [];
+      for (const chunk of chunkIds(args.rootIds, ROOT_ID_CHUNK)) {
+        const idList = soqlIdList(chunk);
+        out.push(
+          `SELECT ${fieldList} FROM ${args.object} WHERE ${args.scope.childFk} IN (${idList})`,
+        );
+      }
+      return out;
     }
     case "child-lookup": {
       const { childObject, lookupField, childFkToRoot } = args.scope;
       if (childObject === undefined || lookupField === undefined || childFkToRoot === undefined)
-        return null;
+        return [];
+      if (args.rootIds.length === 0) return [];
       // One level of SOQL nesting: materialize root IDs as a literal list
       // for the innermost filter. This keeps us within Salesforce's "only
       // one semi-join" limit (which would fire if we left the root scope
-      // as its own subquery).
-      const idList = soqlIdList(args.rootIds);
-      if (idList.length === 0) return null;
-      return (
-        `SELECT ${fieldList} FROM ${args.object} ` +
-        `WHERE Id IN (SELECT ${lookupField} FROM ${childObject} ` +
-        `WHERE ${childFkToRoot} IN (${idList}))`
-      );
+      // as its own subquery). Chunked for URL-length safety.
+      const out: string[] = [];
+      for (const chunk of chunkIds(args.rootIds, ROOT_ID_CHUNK)) {
+        const idList = soqlIdList(chunk);
+        out.push(
+          `SELECT ${fieldList} FROM ${args.object} ` +
+            `WHERE Id IN (SELECT ${lookupField} FROM ${childObject} ` +
+            `WHERE ${childFkToRoot} IN (${idList}))`,
+        );
+      }
+      return out;
     }
     default:
-      return null;
+      return [];
   }
 }
 
@@ -1323,3 +1428,5 @@ async function safeText(res: Response): Promise<string> {
     return "";
   }
 }
+
+export { composeScopeSoqls as _composeScopeSoqls };

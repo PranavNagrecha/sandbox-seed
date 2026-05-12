@@ -38,6 +38,27 @@ import { isStandardRootObject } from "../graph/standard-objects.ts";
  * counts so the agent can surface "N managed-package parents hidden".
  */
 
+/**
+ * Per-object hint that the optional object will silently drop records at
+ * run time unless the FK target is also included in the seed.
+ *
+ * Generated when an optional parent/child has a required (master-detail
+ * OR non-nillable) FK whose target is not already in `mustIncludeParents`.
+ * `requiresStatus` tells the caller whether the target is at least
+ * reachable as an optional (the user can add it via `select`) or absent
+ * from this analyze pass entirely (deeper walk required).
+ */
+export type OptionalParentWarning = {
+  /** The optional object whose required FK is unresolved. */
+  object: string;
+  /** API name of the required reference field on `object`. */
+  fkField: string;
+  /** Object that `fkField` points to. */
+  requiresObject: string;
+  /** `optional` → user can add via `includeOptionalParents` on select. */
+  requiresStatus: "optional" | "missing";
+};
+
 export type SeedClassification = {
   root: string;
   mustIncludeParents: string[];
@@ -53,6 +74,15 @@ export type SeedClassification = {
   hiddenManagedParentNames?: string[];
   hiddenManagedChildNames?: string[];
   hiddenSystemChildNames?: string[];
+  /**
+   * Per-object warnings: optional parents/children that carry a required
+   * FK to an object the user hasn't necessarily picked. If left
+   * unresolved, those records skip silently at run time. The agent (or
+   * user) should add `requiresObject` to `includeOptionalParents` on
+   * `select` when `requiresStatus === "optional"`, or rework the scope
+   * when `requiresStatus === "missing"`.
+   */
+  optionalParentWarnings: OptionalParentWarning[];
 };
 
 export type ClassifyInput = {
@@ -138,18 +168,24 @@ export function classifyForSeed(input: ClassifyInput): SeedClassification {
   const includeManaged = input.includeManagedPackages === true;
   const includeSystem = input.includeSystemChildren === true;
 
-  // Build an index: source → Array<{target, masterDetail, nillable}> for
-  // the "parent" edge kind only (kind === "parent" means source references
-  // target via an FK, so the target must exist first).
+  // Build an index: source → Array<{target, fieldName, masterDetail, nillable}>
+  // for the "parent" edge kind only (kind === "parent" means source
+  // references target via an FK, so the target must exist first).
   const parentEdgesBySource = new Map<
     string,
-    Array<{ target: string; masterDetail: boolean; nillable: boolean }>
+    Array<{
+      target: string;
+      fieldName: string;
+      masterDetail: boolean;
+      nillable: boolean;
+    }>
   >();
   for (const edge of input.graph.edges) {
     if (edge.kind !== "parent") continue;
     const list = parentEdgesBySource.get(edge.source) ?? [];
     list.push({
       target: edge.target,
+      fieldName: edge.fieldName,
       masterDetail: edge.masterDetail,
       nillable: edge.nillable,
     });
@@ -236,6 +272,40 @@ export function classifyForSeed(input: ClassifyInput): SeedClassification {
     optionalChildren.push(c);
   }
 
+  // Cross-walk: for each optional parent/child, check its OWN required
+  // parent FKs. If the FK target isn't already in mustInclude, the user
+  // is at risk of silent row skips at run time — the run-time loader
+  // can't resolve a non-nillable FK whose target was never seeded.
+  // Surface ONE warning per (optional object, unresolved FK) pair so
+  // the caller can either add the target on `select` or rework scope.
+  const optionalNameSet = new Set<string>([...optionalParents, ...optionalChildren]);
+  const optionalParentWarnings: OptionalParentWarning[] = [];
+  for (const obj of optionalNameSet) {
+    const edges = parentEdgesBySource.get(obj) ?? [];
+    for (const e of edges) {
+      if (e.target === root) continue;
+      if (isStandardRootObject(e.target)) continue;
+      const required = e.masterDetail || !e.nillable;
+      if (!required) continue;
+      if (mustInclude.has(e.target)) continue;
+      // Same FK can appear via polymorphic referenceTo; dedupe by tuple.
+      const dup = optionalParentWarnings.find(
+        (w) => w.object === obj && w.fkField === e.fieldName && w.requiresObject === e.target,
+      );
+      if (dup !== undefined) continue;
+      optionalParentWarnings.push({
+        object: obj,
+        fkField: e.fieldName,
+        requiresObject: e.target,
+        requiresStatus: optionalNameSet.has(e.target) ? "optional" : "missing",
+      });
+    }
+  }
+  // Stable sort so successive analyze calls don't churn the response.
+  optionalParentWarnings.sort((a, b) =>
+    a.object === b.object ? a.fkField.localeCompare(b.fkField) : a.object.localeCompare(b.object),
+  );
+
   return {
     root,
     mustIncludeParents: [...mustInclude].sort(),
@@ -250,6 +320,7 @@ export function classifyForSeed(input: ClassifyInput): SeedClassification {
     ...(includeManaged && { hiddenManagedParentNames: hiddenManagedParentNames.sort() }),
     ...(includeManaged && { hiddenManagedChildNames: hiddenManagedChildNames.sort() }),
     ...(includeSystem && { hiddenSystemChildNames: hiddenSystemChildNames.sort() }),
+    optionalParentWarnings,
   };
 }
 

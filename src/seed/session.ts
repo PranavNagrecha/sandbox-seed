@@ -47,7 +47,9 @@ export type UpsertDecisionSummary =
         | "no-candidates"
         | "multiple-candidates"
         | "target-missing-field"
-        | "target-describe-failed";
+        | "target-describe-failed"
+        | "all-candidates-empty"
+        | "override-invalid";
       candidates?: string[];
       detail: string;
     };
@@ -190,6 +192,38 @@ export type Session = {
    * against the same target org stitch FKs automatically.
    */
   isolateIdMap?: boolean;
+  /**
+   * Pre-materialized root IDs when `sampleSize` was applied at start.
+   *
+   * Issue #1 follow-up: previously we wrapped the user's WHERE clause as
+   * `(<original>) AND Id IN ('a','b',...)` so the run-time materialization
+   * query could re-find the sample. That re-query failed with 414 once
+   * the IN list got long enough — and at large samples it 414'd before
+   * the per-object chunking fix could help.
+   *
+   * Now we keep `whereClause` as the user typed it (LLM-readable, plan-
+   * hash stable) and hold the sampled IDs separately. `runExecute` and
+   * `runDryRun` consume `sampledRootIds` directly as the root scope when
+   * present, skipping the root SOQL entirely. Empty / absent → fall back
+   * to materializing from the WHERE clause.
+   */
+  sampledRootIds?: string[];
+  /**
+   * Per-object upsert-key overrides supplied at session start. Threaded
+   * into `runDryRun` and stored on the session so re-running dry_run
+   * (e.g. after a target schema change) consistently honors the user's
+   * pick. Field names are validated against the live source candidate
+   * set at dry-run time — typos surface as `override-invalid`.
+   */
+  upsertKeyOverrides?: Record<string, string>;
+  /**
+   * Per-object upsert-key candidate counts when more than one
+   * external-id field exists on the source. Captured at `select` so the
+   * caller knows where auto-pick will kick in at dry-run time. Counts
+   * only — field names live on disk (dry-run report) to keep schema
+   * details out of the LLM response payload.
+   */
+  upsertKeyConflicts?: Record<string, { candidateCount: number }>;
   /** If the user retries a step after an error, the last error is stored here. */
   lastError?: string;
 };

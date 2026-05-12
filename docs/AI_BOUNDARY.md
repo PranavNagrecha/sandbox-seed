@@ -77,6 +77,17 @@ The tool refuses to invent predicates from natural language. If you ask the mode
 
 This prevents silent over-scoping ("the biggest" → 50,000 rows) and silent under-scoping.
 
+#### Date-literal pitfall: `THIS_YEAR` combined with `> TODAY`
+
+A WHERE clause like `MyDate__c = THIS_YEAR AND MyDate__c > TODAY` is upper-bounded by the calendar year — and on orgs with multi-year future dates (universities, real estate, project plans) most future-dated rows are 2027+ and fall *outside* `THIS_YEAR`. The result is a scope count much smaller than "all future records" reads as.
+
+Prefer:
+
+- `MyDate__c >= TODAY` (unbounded forward), or
+- An explicit range: `MyDate__c >= 2026-01-01 AND MyDate__c <= 2026-12-31`.
+
+Same caveat for `THIS_MONTH`, `THIS_QUARTER`, `THIS_FISCAL_YEAR`, etc. when combined with a forward bound. The tool will surface the scope count on `start` — sanity-check it against your intuition before continuing to `dry_run`.
+
 ### 3. Targets must be sandboxes
 
 Before any write, the tool calls `Organization.IsSandbox` on the target. If false, the operation is refused with `ProductionTargetRefused`. There is no override flag. Production-target writes are tested-against in [tests/mcp/seed-boundary.test.ts](https://github.com/PranavNagrecha/sandbox-seed/blob/main/tests/mcp/seed-boundary.test.ts).

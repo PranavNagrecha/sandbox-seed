@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
+import type { DependencyGraph, EdgeAttrs, NodeAttrs } from "../../src/graph/build.ts";
 import {
   classifyForSeed,
   isManagedPackageObject,
   isSystemChildObject,
 } from "../../src/seed/classify.ts";
-import type { DependencyGraph, EdgeAttrs, NodeAttrs } from "../../src/graph/build.ts";
 
 /**
  * classifyForSeed splits the walked graph into:
@@ -201,10 +201,7 @@ describe("classifyForSeed", () => {
     // Pathological case: object appears in both parentObjects and
     // childObjects. If it's mustInclude via a parent edge, it should NOT
     // be double-listed in optionalChildren.
-    const g = graph(
-      ["A", "B"],
-      [parentEdge("A", "B", "BId", { nillable: false })],
-    );
+    const g = graph(["A", "B"], [parentEdge("A", "B", "BId", { nillable: false })]);
     const r = classifyForSeed({
       graph: g,
       rootObject: "A",
@@ -237,7 +234,9 @@ describe("classifyForSeed", () => {
       ["Opportunity", "Campaign", "APXTConga4__Contract__c", "hed__Department__c"],
       [
         parentEdge("Opportunity", "Campaign", "CampaignId", { nillable: true }),
-        parentEdge("Opportunity", "APXTConga4__Contract__c", "APXTConga4__ContractId__c", { nillable: true }),
+        parentEdge("Opportunity", "APXTConga4__Contract__c", "APXTConga4__ContractId__c", {
+          nillable: true,
+        }),
         parentEdge("Opportunity", "hed__Department__c", "hed__DepartmentId__c", { nillable: true }),
       ],
     );
@@ -363,5 +362,177 @@ describe("classifyForSeed", () => {
       childObjects: new Set(),
     });
     expect(r.optionalParents).toEqual(["A", "B", "C"]);
+  });
+});
+
+/**
+ * Locks in the issue #3 fix: when an optional parent/child has a required
+ * (master-detail OR non-nillable) FK to an object the user hasn't already
+ * picked up via mustInclude, the run-time loader silently skips records.
+ * `classifyForSeed` now surfaces this at analyze time so the user can
+ * add the missing parent to `includeOptionalParents` on `select` instead
+ * of finding out from a run log.
+ */
+describe("classifyForSeed — optionalParentWarnings", () => {
+  it("warns when an optional parent has a required FK to a non-included object", () => {
+    // Opportunity is the root. ChildObj__c is an optional child that
+    // has a required FK to MissingParent__c — which is not in any list.
+    const g = graph(
+      ["Opportunity", "ChildObj__c", "MissingParent__c"],
+      [
+        {
+          source: "ChildObj__c",
+          target: "Opportunity",
+          fieldName: "OpportunityId__c",
+          nillable: true,
+          custom: true,
+          polymorphic: false,
+          masterDetail: false,
+          kind: "child",
+        },
+        parentEdge("ChildObj__c", "MissingParent__c", "MissingParentId__c", {
+          nillable: false,
+        }),
+      ],
+    );
+    const r = classifyForSeed({
+      graph: g,
+      rootObject: "Opportunity",
+      parentObjects: new Set(),
+      childObjects: new Set(["ChildObj__c"]),
+    });
+    expect(r.optionalParentWarnings).toEqual([
+      {
+        object: "ChildObj__c",
+        fkField: "MissingParentId__c",
+        requiresObject: "MissingParent__c",
+        requiresStatus: "missing",
+      },
+    ]);
+  });
+
+  it("marks requiresStatus=optional when the required parent is in the optional list", () => {
+    const g = graph(
+      ["Root__c", "ChildObj__c", "OptionalParent__c"],
+      [
+        parentEdge("ChildObj__c", "OptionalParent__c", "OptionalParentId__c", {
+          nillable: false,
+        }),
+        parentEdge("Root__c", "OptionalParent__c", "ParentId__c", {
+          nillable: true,
+        }),
+        {
+          source: "ChildObj__c",
+          target: "Root__c",
+          fieldName: "RootId__c",
+          nillable: true,
+          custom: true,
+          polymorphic: false,
+          masterDetail: false,
+          kind: "child",
+        },
+      ],
+    );
+    const r = classifyForSeed({
+      graph: g,
+      rootObject: "Root__c",
+      parentObjects: new Set(["OptionalParent__c"]),
+      childObjects: new Set(["ChildObj__c"]),
+    });
+    expect(r.optionalParents).toContain("OptionalParent__c");
+    expect(r.optionalChildren).toContain("ChildObj__c");
+    expect(r.optionalParentWarnings).toEqual([
+      {
+        object: "ChildObj__c",
+        fkField: "OptionalParentId__c",
+        requiresObject: "OptionalParent__c",
+        requiresStatus: "optional",
+      },
+    ]);
+  });
+
+  it("emits no warning when the required parent is already in mustInclude", () => {
+    // ChildObj__c → MustParent__c is required, and Root → MustParent__c is
+    // also required, so MustParent__c is already in mustIncludeParents.
+    // No conditional dependency to warn about.
+    const g = graph(
+      ["Root__c", "ChildObj__c", "MustParent__c"],
+      [
+        parentEdge("Root__c", "MustParent__c", "ParentId__c", { nillable: false }),
+        parentEdge("ChildObj__c", "MustParent__c", "ParentId__c", { nillable: false }),
+        {
+          source: "ChildObj__c",
+          target: "Root__c",
+          fieldName: "RootId__c",
+          nillable: true,
+          custom: true,
+          polymorphic: false,
+          masterDetail: false,
+          kind: "child",
+        },
+      ],
+    );
+    const r = classifyForSeed({
+      graph: g,
+      rootObject: "Root__c",
+      parentObjects: new Set(["MustParent__c"]),
+      childObjects: new Set(["ChildObj__c"]),
+    });
+    expect(r.mustIncludeParents).toEqual(["MustParent__c"]);
+    expect(r.optionalParentWarnings).toEqual([]);
+  });
+
+  it("emits no warning for nillable FKs (those skip silently is the correct behavior)", () => {
+    const g = graph(
+      ["Root__c", "ChildObj__c", "Other__c"],
+      [
+        parentEdge("ChildObj__c", "Other__c", "OtherId__c", { nillable: true }),
+        {
+          source: "ChildObj__c",
+          target: "Root__c",
+          fieldName: "RootId__c",
+          nillable: true,
+          custom: true,
+          polymorphic: false,
+          masterDetail: false,
+          kind: "child",
+        },
+      ],
+    );
+    const r = classifyForSeed({
+      graph: g,
+      rootObject: "Root__c",
+      parentObjects: new Set(),
+      childObjects: new Set(["ChildObj__c"]),
+    });
+    expect(r.optionalParentWarnings).toEqual([]);
+  });
+
+  it("skips warnings for standard-root targets (OwnerId etc.)", () => {
+    // ChildObj__c.OwnerId → User is required, but User is a standard root
+    // and resolved by the running user at run time — never seeded.
+    const g = graph(
+      ["Root__c", "ChildObj__c", "User"],
+      [
+        parentEdge("ChildObj__c", "User", "OwnerId", { nillable: false }),
+        {
+          source: "ChildObj__c",
+          target: "Root__c",
+          fieldName: "RootId__c",
+          nillable: true,
+          custom: true,
+          polymorphic: false,
+          masterDetail: false,
+          kind: "child",
+        },
+      ],
+    );
+    const r = classifyForSeed({
+      graph: g,
+      rootObject: "Root__c",
+      parentObjects: new Set(),
+      childObjects: new Set(["ChildObj__c"]),
+    });
+    expect(r.optionalParentWarnings).toEqual([]);
   });
 });

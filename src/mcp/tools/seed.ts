@@ -3,32 +3,28 @@ import type { OrgAuth } from "../../auth/sf-auth.ts";
 import { resolveAuth } from "../../auth/sf-auth.ts";
 import { DescribeCache } from "../../describe/cache.ts";
 import { DescribeClient } from "../../describe/client.ts";
+import { queryActiveValidationRules } from "../../describe/tooling-client.ts";
+import { isReference } from "../../describe/types.ts";
 import { ApiError, UserError } from "../../errors.ts";
 import { computeLoadOrder } from "../../graph/order.ts";
 import { runInspect } from "../../inspect/run.ts";
+import { salesforceFetch } from "../../salesforce-fetch.ts";
 import { classifyForSeed } from "../../seed/classify.ts";
 import { runDryRun } from "../../seed/dry-run.ts";
 import { runExecute } from "../../seed/execute.ts";
+import { queryCount, queryIds, validateWhereClause } from "../../seed/extract.ts";
 import { buildCanonicalPlan, hashCanonicalPlan } from "../../seed/plan-hash.ts";
 import {
-  queryCount,
-  queryIds,
-  soqlIdList,
-  validateWhereClause,
-} from "../../seed/extract.ts";
-import {
   DRY_RUN_FRESHNESS_MS,
-  isDryRunFresh,
-  SessionStore,
   type Session,
+  SessionStore,
+  isDryRunFresh,
 } from "../../seed/session.ts";
+import { discoverCandidates } from "../../seed/upsert-key.ts";
 import {
   findPendingRecoveries,
   reactivateFromSnapshot,
 } from "../../seed/validation-rule-toggle.ts";
-import { queryActiveValidationRules } from "../../describe/tooling-client.ts";
-import { isReference } from "../../describe/types.ts";
-import { salesforceFetch } from "../../salesforce-fetch.ts";
 
 /**
  * The ONE MCP tool.
@@ -52,14 +48,7 @@ const DEFAULT_SCOPE_LIMIT = 10_000;
 
 export const SeedArgs = z.object({
   action: z
-    .enum([
-      "start",
-      "analyze",
-      "select",
-      "dry_run",
-      "run",
-      "recover_validation_rules",
-    ])
+    .enum(["start", "analyze", "select", "dry_run", "run", "recover_validation_rules"])
     .describe(
       "Which step of the seed flow to execute. `recover_validation_rules` is a " +
         "safety-net action — run it when a prior session left target-org " +
@@ -149,7 +138,7 @@ export const SeedArgs = z.object({
         "were Active=true at snapshot time are touched — rules the user had " +
         "pre-disabled are left alone. If the process crashes between deactivate " +
         "and reactivate, the next tool call refuses new work until the user runs " +
-        "`action: \"recover_validation_rules\"`. Default false.",
+        '`action: "recover_validation_rules"`. Default false.',
     ),
   childLookups: z
     .record(z.string().min(1), z.array(z.string().min(1)).min(1))
@@ -172,6 +161,19 @@ export const SeedArgs = z.object({
         "cross-run FK stitching is disabled for this session only. Default " +
         "false: the project map is consulted on dry_run (for already-seeded " +
         "prediction) and merged back on run (for the next session's benefit).",
+    ),
+  upsertKeyOverrides: z
+    .record(z.string().min(1), z.string().min(1))
+    .optional()
+    .describe(
+      "For action=start. Per-object upsert-key overrides. Key = object API " +
+        "name; value = external-id field on the source to use as the upsert " +
+        "key. When an object has multiple eligible external-id fields, " +
+        "auto-pick (highest population on source) handles most cases — pass " +
+        "an override only when the user wants to force a specific field " +
+        "(e.g. the auto-pick chose wrong on a prior run). Invalid overrides " +
+        "(field not on source / not upsert-eligible) surface as ambiguous " +
+        "at dry_run; INSERT-with-recovery handles the rest.",
     ),
 });
 
@@ -196,10 +198,7 @@ export type SeedResponse = {
   guidance: string;
 };
 
-export async function seed(
-  args: SeedArgsT,
-  overrides: SeedOverrides = {},
-): Promise<SeedResponse> {
+export async function seed(args: SeedArgsT, overrides: SeedOverrides = {}): Promise<SeedResponse> {
   const store = new SessionStore({ rootDir: overrides.sessionRootDir });
   await store.gc().catch(() => {
     /* GC failure is never fatal */
@@ -209,9 +208,7 @@ export async function seed(
   // rules deactivated on the target, refuse new work until the user
   // reactivates them. The recovery action itself is exempt (obviously).
   if (args.action !== "recover_validation_rules") {
-    const pending = await findPendingRecoveries(store.sessionsRoot()).catch(
-      () => [],
-    );
+    const pending = await findPendingRecoveries(store.sessionsRoot()).catch(() => []);
     if (pending.length > 0) {
       const list = pending
         .map(
@@ -298,9 +295,7 @@ async function doStart(
   // reference on that child's describe. Fail fast with the offending name.
   if (args.childLookups !== undefined) {
     const rootDesc = await sourceDesc.describeObject(args.object!);
-    const rootChildTypes = new Set(
-      (rootDesc.childRelationships ?? []).map((c) => c.childSObject),
-    );
+    const rootChildTypes = new Set((rootDesc.childRelationships ?? []).map((c) => c.childSObject));
     for (const [childObj, fieldNames] of Object.entries(args.childLookups)) {
       if (!known.has(childObj)) {
         throw new UserError(
@@ -350,13 +345,15 @@ async function doStart(
     );
   }
 
-  // sampleSize: take the first N deterministically and rewrite scope
-  // to `Id IN (…sampled IDs…)`. This is the "LIMIT 10 of 162" semantic
-  // the user wanted. `limit` stays as a hard cap — even with sampleSize,
-  // we refuse to materialize more IDs than `limit`.
-  let effectiveWhereClause = args.whereClause!;
+  // sampleSize: take the first N deterministically and stash their IDs on
+  // the session. We do NOT rewrite the WHERE clause anymore — issue #1
+  // showed the rewritten URL 414s on the root materialization at large
+  // samples. `runExecute` / `runDryRun` consume `sampledRootIds` directly
+  // when set; otherwise they query for the root scope from the WHERE.
+  // `limit` stays as a hard cap — even with sampleSize, we refuse to
+  // materialize more IDs than `limit`.
   let scopeCount = matchedCount;
-  let sampleApplied = false;
+  let sampledRootIds: string[] | undefined;
 
   if (args.sampleSize !== undefined) {
     if (args.sampleSize > limit) {
@@ -366,22 +363,21 @@ async function doStart(
       );
     }
     if (args.sampleSize < matchedCount) {
-      const sampledIds = await queryIds({
+      const ids = await queryIds({
         auth: sourceAuth,
         soql:
           `SELECT Id FROM ${args.object} WHERE ${args.whereClause} ` +
           `ORDER BY Id LIMIT ${args.sampleSize}`,
         fetchFn: overrides.fetchFn,
       });
-      if (sampledIds.length === 0) {
+      if (ids.length === 0) {
         throw new UserError(
           `Failed to materialize sample of size ${args.sampleSize}.`,
           `The query returned no IDs — try a broader WHERE clause.`,
         );
       }
-      effectiveWhereClause = `(${args.whereClause}) AND Id IN (${soqlIdList(sampledIds)})`;
-      scopeCount = sampledIds.length;
-      sampleApplied = true;
+      sampledRootIds = ids;
+      scopeCount = ids.length;
     } else {
       // sampleSize >= matchedCount: no sampling needed, full scope fits.
       scopeCount = matchedCount;
@@ -397,14 +393,17 @@ async function doStart(
     sourceOrg: args.sourceOrg!,
     targetOrg: args.targetOrg!,
     rootObject: args.object!,
-    whereClause: effectiveWhereClause,
+    whereClause: args.whereClause!,
     limit,
     scopeCount,
     disableValidationRulesOnRun: args.disableValidationRulesOnRun === true,
     childLookups: args.childLookups,
     isolateIdMap: args.isolateIdMap === true,
+    upsertKeyOverrides: args.upsertKeyOverrides,
+    sampledRootIds,
   });
 
+  const sampleApplied = sampledRootIds !== undefined;
   return {
     sessionId: session.id,
     step: "started",
@@ -413,7 +412,7 @@ async function doStart(
       sourceOrg: session.sourceOrg,
       targetOrg: session.targetOrg,
       rootObject: session.rootObject,
-      whereClause: args.whereClause!, // surface the user's original clause, not the rewritten one
+      whereClause: args.whereClause!,
       matchedCount,
       scopeCount,
       limit,
@@ -500,6 +499,13 @@ async function doAnalyze(
         `re-run with \`includeManagedPackages: true\` or \`includeSystemChildren: true\` to see them)`
       : "";
 
+  const warningHint =
+    classification.optionalParentWarnings.length > 0
+      ? ` Heads-up: ${classification.optionalParentWarnings.length} optional object(s) carry required FKs to ` +
+        `non-included parents — picking them without the required parent will silently skip records at run time. ` +
+        `See \`optionalParentWarnings\` in the summary.`
+      : "";
+
   return {
     sessionId: session.id,
     step: session.step,
@@ -521,12 +527,14 @@ async function doAnalyze(
       })),
       childLookups: session.childLookups ?? {},
       childLookupTargets: result.childLookupTargets,
+      optionalParentWarnings: classification.optionalParentWarnings,
     },
     nextAction: "select",
     guidance:
       `Must-include parents (non-negotiable): ${arrOrNone(classification.mustIncludeParents)}. ` +
       `Optional parents (${classification.optionalParents.length}): ${arrOrNone(classification.optionalParents)}. ` +
       `Optional children (${classification.optionalChildren.length}): ${arrOrNone(classification.optionalChildren)}.` +
+      warningHint +
       hiddenHint +
       ` Ask the user which optional parents and children to include, then call ` +
       `seed with action: "select".`,
@@ -594,12 +602,51 @@ async function doSelect(
   const restrictedPlan = computeLoadOrder(result.graph, { requestedObjects: finalObjectList });
   const finalLoadOrder = loadOrderObjects(restrictedPlan.steps);
 
+  // Probe each object's upsert-key candidate count so the caller can see
+  // which objects auto-pick will have to disambiguate at dry-run time.
+  // We surface ONLY counts here — field names belong on disk (the dry-run
+  // report) so we don't paint specific schema details into the LLM
+  // context. The caller can pass `upsertKeyOverrides` on a fresh `start`
+  // call if they want to force a specific field for an ambiguous object.
+  const sourceCache = new DescribeCache({
+    orgId: sourceAuth.orgId,
+    ttlSeconds: 86400,
+    cacheRoot: overrides.cacheRoot,
+  });
+  const sourceDescribe = new DescribeClient({
+    auth: sourceAuth,
+    cache: sourceCache,
+    fetchFn: overrides.fetchFn,
+  });
+  const upsertKeyConflicts: Record<string, { candidateCount: number }> = {};
+  for (const object of finalObjectList) {
+    try {
+      const desc = await sourceDescribe.describeObject(object);
+      const candidates = discoverCandidates(desc);
+      if (candidates.length > 1) {
+        upsertKeyConflicts[object] = { candidateCount: candidates.length };
+      }
+    } catch {
+      // Best-effort — dry_run will surface describe failures with full
+      // context. We don't want a single describe miss to kill `select`.
+    }
+  }
+
   session.selectedOptionalParents = chosenParents;
   session.selectedOptionalChildren = chosenChildren;
   session.finalObjectList = finalObjectList;
   session.finalLoadOrder = finalLoadOrder;
+  session.upsertKeyConflicts = upsertKeyConflicts;
   session.step = "selected";
   await store.save(session);
+
+  const conflictCount = Object.keys(upsertKeyConflicts).length;
+  const conflictHint =
+    conflictCount > 0
+      ? ` ${conflictCount} object(s) have multiple eligible external-id fields — ` +
+        `auto-pick (highest population) handles this at dry_run. Pass ` +
+        `\`upsertKeyOverrides\` to start a new session if you need to force a specific field.`
+      : "";
 
   return {
     sessionId: session.id,
@@ -610,11 +657,13 @@ async function doSelect(
       finalLoadOrder,
       excluded: restrictedPlan.excluded,
       cycleStepCount: restrictedPlan.steps.filter((s) => s.kind === "cycle").length,
+      upsertKeyConflicts,
     },
     nextAction: "dry_run",
     guidance:
-      `Final load order (${finalObjectList.length} object(s)): ${finalLoadOrder.join(" → ")}. ` +
-      `Next: call seed with action: "dry_run" — this is mandatory before you can run.`,
+      `Final load order (${finalObjectList.length} object(s)): ${finalLoadOrder.join(" → ")}.` +
+      conflictHint +
+      ` Next: call seed with action: "dry_run" — this is mandatory before you can run.`,
   };
 }
 
@@ -697,14 +746,14 @@ async function doDryRun(
     targetAliasForIdMap: session.targetOrg,
     targetIdentity,
     isolateIdMap: session.isolateIdMap === true,
+    upsertKeyOverrides: session.upsertKeyOverrides,
+    sampledRootIds: session.sampledRootIds,
   });
 
   // If this session opted into deactivating target-org validation rules
   // on run, preview which rules would be touched. Purely informational —
   // the actual flip happens inside runExecute.
-  let vrPreview:
-    | { count: number; rulesByObject: Record<string, string[]> }
-    | undefined;
+  let vrPreview: { count: number; rulesByObject: Record<string, string[]> } | undefined;
   if (session.disableValidationRulesOnRun === true) {
     try {
       const rules = await queryActiveValidationRules({
@@ -775,10 +824,7 @@ async function doDryRun(
   }
   if (summary.alreadySeededCounts !== undefined) {
     summaryOut.alreadySeededCounts = summary.alreadySeededCounts;
-    const totalAlready = Object.values(summary.alreadySeededCounts).reduce(
-      (a, b) => a + b,
-      0,
-    );
+    const totalAlready = Object.values(summary.alreadySeededCounts).reduce((a, b) => a + b, 0);
     summaryOut.totalAlreadySeeded = totalAlready;
   }
   if (summary.projectIdMapPath !== undefined) {
@@ -909,6 +955,7 @@ async function doRun(
       finalObjectList: session.finalObjectList,
       loadPlan: restrictedPlan,
       upsertDecisions: session.dryRun.upsertDecisions,
+      sampledRootIds: session.sampledRootIds,
     });
     const nowHash = hashCanonicalPlan(nowPlan);
     if (nowHash !== session.dryRun.planHash) {
@@ -948,6 +995,7 @@ async function doRun(
       targetAliasForIdMap: session.targetOrg,
       targetIdentity,
       isolateIdMap: session.isolateIdMap === true,
+      sampledRootIds: session.sampledRootIds,
     });
   } catch (err) {
     session.lastError = err instanceof Error ? err.message : String(err);
@@ -974,8 +1022,7 @@ async function doRun(
     summaryOut.validationRulesTouched = executed.validationRulesTouched;
   }
   if (executed.validationRulesReactivationFailed !== undefined) {
-    summaryOut.validationRulesReactivationFailed =
-      executed.validationRulesReactivationFailed;
+    summaryOut.validationRulesReactivationFailed = executed.validationRulesReactivationFailed;
   }
   if (executed.projectIdMapPath !== undefined) {
     summaryOut.projectIdMapPath = executed.projectIdMapPath;
@@ -1002,8 +1049,7 @@ async function doRun(
     executed.validationRulesReactivationFailed.length > 0
       ? ` ⚠ ${executed.validationRulesReactivationFailed.length} validation rule(s) FAILED to reactivate — ` +
         `run action: "recover_validation_rules" with sessionId: "${session.id}" before any other seed work.`
-      : typeof executed.validationRulesTouched === "number" &&
-          executed.validationRulesTouched > 0
+      : typeof executed.validationRulesTouched === "number" && executed.validationRulesTouched > 0
         ? ` Deactivated + reactivated ${executed.validationRulesTouched} target-org validation rule(s).`
         : "";
 
@@ -1033,8 +1079,7 @@ async function doRecoverValidationRules(
 ): Promise<SeedResponse> {
   const session = await loadSession(args, store);
 
-  const targetAuth =
-    overrides.authByTarget ?? (await resolveAuth(session.targetOrg, API_VERSION));
+  const targetAuth = overrides.authByTarget ?? (await resolveAuth(session.targetOrg, API_VERSION));
 
   const result = await reactivateFromSnapshot({
     auth: targetAuth,
@@ -1071,10 +1116,7 @@ async function doRecoverValidationRules(
 // ────────────────────────────────────────────────────────────────────
 
 function requireField(name: string, action: string): never {
-  throw new UserError(
-    `action: "${action}" requires \`${name}\`.`,
-    `Supply ${name} and try again.`,
-  );
+  throw new UserError(`action: "${action}" requires \`${name}\`.`, `Supply ${name} and try again.`);
 }
 
 async function loadSession(args: SeedArgsT, store: SessionStore): Promise<Session> {
@@ -1087,9 +1129,7 @@ async function loadSession(args: SeedArgsT, store: SessionStore): Promise<Sessio
   return await store.load(args.sessionId);
 }
 
-function loadOrderObjects(
-  steps: ReturnType<typeof computeLoadOrder>["steps"],
-): string[] {
+function loadOrderObjects(steps: ReturnType<typeof computeLoadOrder>["steps"]): string[] {
   const out: string[] = [];
   for (const s of steps) {
     if (s.kind === "single") out.push(s.object);
