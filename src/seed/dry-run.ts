@@ -4,25 +4,22 @@ import type { OrgAuth } from "../auth/sf-auth.ts";
 import type { DescribeClient } from "../describe/client.ts";
 import type { Field, SObjectDescribe } from "../describe/types.ts";
 import { isReference } from "../describe/types.ts";
+import { UserError } from "../errors.ts";
 import type { DependencyGraph } from "../graph/build.ts";
 import type { LoadPlan } from "../graph/order.ts";
-import { UserError } from "../errors.ts";
+import { salesforceFetch } from "../salesforce-fetch.ts";
 import {
+  ROOT_ID_CHUNK,
+  type ScopePath,
   chunkIds,
   computeScopePaths,
   queryIds,
   soqlIdList,
-  type ScopePath,
 } from "./extract.ts";
-import {
-  buildCanonicalPlan,
-  canonicalStringify,
-  hashCanonicalPlan,
-} from "./plan-hash.ts";
+import { buildCanonicalPlan, canonicalStringify, hashCanonicalPlan } from "./plan-hash.ts";
 import { ProjectIdMap, type TargetIdentity } from "./project-id-map.ts";
 import type { DryRunSummary, UpsertDecisionSummary } from "./session.ts";
-import { resolveUpsertKey } from "./upsert-key.ts";
-import { salesforceFetch } from "../salesforce-fetch.ts";
+import { discoverCandidates, queryFieldPopulation, resolveUpsertKey } from "./upsert-key.ts";
 
 const DEFAULTED_OWNER_TARGETS = new Set(["User", "Group", "Queue"]);
 
@@ -70,6 +67,21 @@ export type DryRunOptions = {
   targetAliasForIdMap?: string;
   targetIdentity?: TargetIdentity;
   isolateIdMap?: boolean;
+  /**
+   * Per-object upsert-key overrides set at session start. When present,
+   * resolveUpsertKey uses the named field verbatim instead of running
+   * auto-pick by population — provided the field is still in the
+   * source's candidate set. Invalid overrides surface as
+   * `ambiguous: "override-invalid"` so the user sees the typo or stale
+   * field name and can fix it before `run`.
+   */
+  upsertKeyOverrides?: Record<string, string>;
+  /**
+   * Pre-materialized root scope when `sampleSize` was applied at start.
+   * See `ExecuteOptions.sampledRootIds`. dry_run honors this so the
+   * scope it reports MATCHES what the run will process.
+   */
+  sampledRootIds?: string[];
 };
 
 export async function runDryRun(opts: DryRunOptions): Promise<DryRunSummary> {
@@ -89,12 +101,18 @@ export async function runDryRun(opts: DryRunOptions): Promise<DryRunSummary> {
   }
 
   // Materialize root scope IDs — we need them to resolve transitive parents,
-  // and we write a sample into the report for the user.
-  const rootIds = await queryIds({
-    auth: opts.sourceAuth,
-    soql: `SELECT Id FROM ${opts.rootObject} WHERE ${opts.whereClause}`,
-    fetchFn: opts.fetchFn,
-  });
+  // and we write a sample into the report for the user. When the session
+  // was started with `sampleSize`, the sampled IDs are already on the
+  // session; reuse them so the dry-run scope MATCHES what the run will
+  // process (and avoid re-querying the WHERE clause from scratch).
+  const rootIds =
+    opts.sampledRootIds !== undefined && opts.sampledRootIds.length > 0
+      ? [...opts.sampledRootIds]
+      : await queryIds({
+          auth: opts.sourceAuth,
+          soql: `SELECT Id FROM ${opts.rootObject} WHERE ${opts.whereClause}`,
+          fetchFn: opts.fetchFn,
+        });
 
   if (rootIds.length === 0) {
     throw new UserError(
@@ -209,7 +227,35 @@ export async function runDryRun(opts: DryRunOptions): Promise<DryRunSummary> {
           );
         }
       }
-      upsertDecisions[object] = resolveUpsertKey(srcDesc, tgtDesc);
+      // Population probe — only needed when the source has 2+ ext-id
+      // candidates, since the single-candidate path doesn't need to
+      // disambiguate. One extra SOQL per ambiguous object; ~free for
+      // dry-run. Scope: pass the user's WHERE clause only for the root
+      // (it's the only object whose scope is expressible as a literal
+      // WHERE); for child / parent objects we count against the whole
+      // object — a small approximation in exchange for not having to
+      // materialize per-object scope.
+      const candidateNames = discoverCandidates(srcDesc).map((c) => c.name);
+      let populationByField: Map<string, number> | undefined;
+      if (candidateNames.length > 1) {
+        try {
+          populationByField = await queryFieldPopulation({
+            auth: opts.sourceAuth,
+            object,
+            fields: candidateNames,
+            whereClause: object === opts.rootObject ? opts.whereClause : undefined,
+            fetchFn: opts.fetchFn,
+          });
+        } catch {
+          // Best-effort — if the probe fails, fall back to the
+          // historic "multiple-candidates" ambiguous result.
+        }
+      }
+      const override = opts.upsertKeyOverrides?.[object];
+      upsertDecisions[object] = resolveUpsertKey(srcDesc, tgtDesc, {
+        populationByField,
+        override,
+      });
     } catch (err) {
       schemaIssues.push(
         `${object}: describe failed (${err instanceof Error ? err.message : String(err)})`,
@@ -229,10 +275,7 @@ export async function runDryRun(opts: DryRunOptions): Promise<DryRunSummary> {
     perObjectSoql,
     fetchFn: opts.fetchFn,
   });
-  const totalDefaultedOwnerRefs = Object.values(defaultedByObject).reduce(
-    (a, b) => a + b,
-    0,
-  );
+  const totalDefaultedOwnerRefs = Object.values(defaultedByObject).reduce((a, b) => a + b, 0);
 
   const totalRecords = Object.values(perObjectCounts).reduce((a, b) => a + b, 0);
   const completedAt = new Date().toISOString();
@@ -251,6 +294,7 @@ export async function runDryRun(opts: DryRunOptions): Promise<DryRunSummary> {
     finalObjectList: opts.finalObjectList,
     loadPlan: opts.loadPlan,
     upsertDecisions,
+    sampledRootIds: opts.sampledRootIds,
   });
   const planHash = hashCanonicalPlan(canonicalPlan);
   const planPath = join(opts.sessionDir, "plan.json");
@@ -397,31 +441,35 @@ async function idsForPath(opts: {
   }
 
   if (path.kind === "direct-parent" && path.rootFk !== undefined) {
-    const idList = soqlIdList(opts.rootIds);
-    if (idList.length === 0) {
+    if (opts.rootIds.length === 0) {
       return {
         ids: [],
         soql: `-- direct-parent ${path.object} via ${path.rootFk}: root scope is empty`,
       };
     }
-    const whereClause = `Id IN (SELECT ${path.rootFk} FROM ${opts.rootObject} WHERE Id IN (${idList}))`;
-    const soql = `SELECT Id FROM ${path.object} WHERE ${whereClause}`;
-    const ids = await queryIds({ auth: opts.auth, soql, fetchFn: opts.fetchFn });
-    return { ids, soql };
+    return await runChunkedIdQuery({
+      auth: opts.auth,
+      rootIds: opts.rootIds,
+      fetchFn: opts.fetchFn,
+      composeSoql: (idList) =>
+        `SELECT Id FROM ${path.object} ` +
+        `WHERE Id IN (SELECT ${path.rootFk} FROM ${opts.rootObject} WHERE Id IN (${idList}))`,
+    });
   }
 
   if (path.kind === "direct-child" && path.childFk !== undefined) {
-    const idList = soqlIdList(opts.rootIds);
-    if (idList.length === 0) {
+    if (opts.rootIds.length === 0) {
       return {
         ids: [],
         soql: `-- direct-child ${path.object} via ${path.childFk}: root scope is empty`,
       };
     }
-    const whereClause = `${path.childFk} IN (${idList})`;
-    const soql = `SELECT Id FROM ${path.object} WHERE ${whereClause}`;
-    const ids = await queryIds({ auth: opts.auth, soql, fetchFn: opts.fetchFn });
-    return { ids, soql };
+    return await runChunkedIdQuery({
+      auth: opts.auth,
+      rootIds: opts.rootIds,
+      fetchFn: opts.fetchFn,
+      composeSoql: (idList) => `SELECT Id FROM ${path.object} WHERE ${path.childFk} IN (${idList})`,
+    });
   }
 
   if (
@@ -430,19 +478,21 @@ async function idsForPath(opts: {
     path.lookupField !== undefined &&
     path.childFkToRoot !== undefined
   ) {
-    const idList = soqlIdList(opts.rootIds);
-    if (idList.length === 0) {
+    if (opts.rootIds.length === 0) {
       return {
         ids: [],
         soql: `-- child-lookup ${path.object} via ${path.childObject}.${path.lookupField}: root scope is empty`,
       };
     }
-    const whereClause =
-      `Id IN (SELECT ${path.lookupField} FROM ${path.childObject} ` +
-      `WHERE ${path.childFkToRoot} IN (${idList}))`;
-    const soql = `SELECT Id FROM ${path.object} WHERE ${whereClause}`;
-    const ids = await queryIds({ auth: opts.auth, soql, fetchFn: opts.fetchFn });
-    return { ids, soql };
+    return await runChunkedIdQuery({
+      auth: opts.auth,
+      rootIds: opts.rootIds,
+      fetchFn: opts.fetchFn,
+      composeSoql: (idList) =>
+        `SELECT Id FROM ${path.object} ` +
+        `WHERE Id IN (SELECT ${path.lookupField} FROM ${path.childObject} ` +
+        `WHERE ${path.childFkToRoot} IN (${idList}))`,
+    });
   }
 
   if (path.kind === "transitive" && Array.isArray(path.chain) && path.chain.length >= 3) {
@@ -454,6 +504,39 @@ async function idsForPath(opts: {
     ids: [],
     soql: `-- no known path from ${opts.rootObject} to ${path.object}; skipped`,
   };
+}
+
+/**
+ * Run a chunked `SELECT Id ...` query: split rootIds into URL-safe chunks,
+ * issue one query per chunk, union the resulting IDs.
+ *
+ * `composeSoql(idList)` receives an already-quoted comma-separated string
+ * of IDs for one chunk; it returns the full SOQL for that chunk. The first
+ * chunk's SOQL is returned verbatim for the dry-run report, prefixed with
+ * a `-- chunked: ...` comment when more than one chunk was issued so the
+ * user can see that the query is split.
+ */
+async function runChunkedIdQuery(opts: {
+  auth: OrgAuth;
+  rootIds: string[];
+  composeSoql: (idList: string) => string;
+  fetchFn?: typeof fetch;
+}): Promise<{ ids: string[]; soql: string }> {
+  const chunks = chunkIds(opts.rootIds, ROOT_ID_CHUNK);
+  const unioned = new Set<string>();
+  let firstSoql = "";
+  for (const chunk of chunks) {
+    const idList = soqlIdList(chunk);
+    const soql = opts.composeSoql(idList);
+    if (firstSoql === "") firstSoql = soql;
+    const got = await queryIds({ auth: opts.auth, soql, fetchFn: opts.fetchFn });
+    for (const id of got) unioned.add(id);
+  }
+  const annotatedSoql =
+    chunks.length > 1
+      ? `-- chunked into ${chunks.length} queries of up to ${ROOT_ID_CHUNK} root IDs each; first chunk shown\n${firstSoql}`
+      : firstSoql;
+  return { ids: [...unioned], soql: annotatedSoql };
 }
 
 function renderReport(args: {

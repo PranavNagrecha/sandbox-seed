@@ -16,6 +16,9 @@ import type { UpsertDecisionSummary } from "./session.ts";
  *   - source / target aliases
  *   - the full restricted load order (step kind, objects, break edges)
  *   - per-object upsert decision (INSERT vs UPSERT + picked key)
+ *   - sampled-root-IDs fingerprint when `sampleSize` was applied (so the
+ *     run can't drift onto a different sample after the user signed off
+ *     on the dry-run)
  *
  * Intentionally NOT in the hash:
  *   - createable field list per object — schema drift is a per-field
@@ -33,6 +36,14 @@ export type CanonicalPlan = {
   sourceAlias: string;
   targetAlias: string;
   objects: CanonicalPlanObject[];
+  /**
+   * SHA-256 hex of the sorted sampled root-ID list when `sampleSize` was
+   * applied at start. Absent when the seed wasn't sampled (full WHERE
+   * scope). The full ID list isn't in the canonical plan to keep
+   * `plan.json` small at high sample counts; the fingerprint is enough
+   * for the dry_run/run drift check.
+   */
+  sampledRootIdsFingerprint?: string;
 };
 
 export type CanonicalPlanObject = {
@@ -53,6 +64,13 @@ export type BuildCanonicalPlanArgs = {
   finalObjectList: string[];
   loadPlan: LoadPlan;
   upsertDecisions?: Record<string, UpsertDecisionSummary>;
+  /**
+   * Pre-materialized sampled root IDs from `start`. When provided, the
+   * canonical plan includes a fingerprint so dry_run / run cannot drift
+   * onto a different sample silently. Pass the same array that was
+   * stored on the session — order is normalized internally.
+   */
+  sampledRootIds?: string[];
 };
 
 /**
@@ -65,7 +83,10 @@ export function buildCanonicalPlan(args: BuildCanonicalPlanArgs): CanonicalPlan 
   // Objects not present in the load plan (e.g. excluded standard-roots)
   // fall back to step="single", breakEdge=null so their presence/absence
   // in finalObjectList still contributes to the hash.
-  const stepByObject = new Map<string, { kind: "single" | "cycle"; breakEdge: CanonicalPlanObject["breakEdge"] }>();
+  const stepByObject = new Map<
+    string,
+    { kind: "single" | "cycle"; breakEdge: CanonicalPlanObject["breakEdge"] }
+  >();
   for (const step of args.loadPlan.steps) {
     if (step.kind === "single") {
       stepByObject.set(step.object, { kind: "single", breakEdge: null });
@@ -90,6 +111,11 @@ export function buildCanonicalPlan(args: BuildCanonicalPlanArgs): CanonicalPlan 
     objects.push({ name, step: step.kind, breakEdge: step.breakEdge, upsertDecision });
   }
 
+  const sampledRootIdsFingerprint =
+    args.sampledRootIds !== undefined && args.sampledRootIds.length > 0
+      ? fingerprintIds(args.sampledRootIds)
+      : undefined;
+
   return {
     version: 1,
     rootObject: args.rootObject,
@@ -97,7 +123,17 @@ export function buildCanonicalPlan(args: BuildCanonicalPlanArgs): CanonicalPlan 
     sourceAlias: args.sourceAlias,
     targetAlias: args.targetAlias,
     objects,
+    ...(sampledRootIdsFingerprint !== undefined ? { sampledRootIdsFingerprint } : {}),
   };
+}
+
+/**
+ * Stable fingerprint over an unordered ID set. Sort first so the hash is
+ * invariant to the order Salesforce happened to return rows in.
+ */
+function fingerprintIds(ids: string[]): string {
+  const sorted = [...ids].sort();
+  return createHash("sha256").update(sorted.join(",")).digest("hex");
 }
 
 /**
