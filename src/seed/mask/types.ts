@@ -8,8 +8,29 @@ import type { Field } from "../../describe/types.ts";
  */
 export const OMIT_ROW: unique symbol = Symbol("sandbox-seed:OMIT_ROW");
 
-/** A masked scalar, a preserved null/empty, or the fail-closed sentinel. */
-export type MaskResult = string | null | typeof OMIT_ROW;
+/**
+ * What a masker hands back for one field: a masked string, a value copied
+ * through unchanged (types/values v1 can't safely text-mask), a preserved
+ * null, or the fail-closed sentinel.
+ */
+export type MaskResult = string | number | boolean | null | typeof OMIT_ROW;
+
+/**
+ * Salesforce field types v1 masking can safely transform — free text only.
+ * Other types (boolean, date/datetime, number/currency, picklist, reference,
+ * id, …) are copied through unchanged: a text preset would produce an invalid
+ * value (bad picklist, non-date, …) and fail the insert. Number/date presets
+ * are a documented fast-follow. `encryptedstring` (e.g. SSN) IS maskable — the
+ * value is string-shaped and the target re-encrypts on insert.
+ */
+export const MASKABLE_FIELD_TYPES: ReadonlySet<string> = new Set([
+  "string",
+  "textarea",
+  "email",
+  "phone",
+  "url",
+  "encryptedstring",
+]);
 
 /**
  * How to mask a selected field. `auto` defers to `pickStrategy` (type/name

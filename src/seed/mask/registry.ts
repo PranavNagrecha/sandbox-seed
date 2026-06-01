@@ -9,6 +9,7 @@ import {
   streetAddressPreset,
 } from "./presets.ts";
 import {
+  MASKABLE_FIELD_TYPES,
   type MaskContext,
   type MaskResult,
   type MaskSelection,
@@ -61,7 +62,16 @@ export function createMasker(opts: { salt: string; selection: MaskSelection }): 
       if (isReference(field)) return OMIT_ROW;
       // Preserve null/blank — do not fabricate PII into empty fields. (#6)
       if (value === null || value === undefined) return null;
-      if (typeof value !== "string") return OMIT_ROW; // non-text → fail closed
+      // v1 text-masks free-text only. Copy through anything it can't safely
+      // text-mask — non-maskable field types (boolean, date, number, picklist,
+      // …) and non-string values — instead of dropping the row (OMIT) or
+      // emitting an invalid value. The default selection already excludes these
+      // types; this guards explicit overrides. (T14: real Contacts carry
+      // boolean/picklist fields whose NAMES match the PII detector, which used
+      // to fail-closed and drop every row.)
+      if (!MASKABLE_FIELD_TYPES.has(field.type) || typeof value !== "string") {
+        return value as MaskResult;
+      }
       if (value === "") return "";
 
       const resolved: ConcreteStrategy = strat === "auto" ? pickStrategy(field) : strat;
