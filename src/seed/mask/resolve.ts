@@ -1,5 +1,5 @@
 import type { DependencyGraph } from "../../graph/build.ts";
-import type { MaskSelection, MaskStrategy } from "./types.ts";
+import { MASKABLE_FIELD_TYPES, type MaskSelection, type MaskStrategy } from "./types.ts";
 
 /**
  * A user-supplied masking instruction for one field. Either a bare field name
@@ -52,10 +52,15 @@ export function resolveMaskSelection(
     return created;
   };
 
-  // 1. Defaults: every detector-flagged sensitive field → "auto" (in scope).
+  // 1. Defaults: every detector-flagged sensitive field of a maskable text
+  // type → "auto" (in scope). Non-text types (boolean, picklist, date, number)
+  // are skipped — v1 can't text-mask them, and selecting them would drop rows
+  // or emit invalid values. They surface as "not masked" in the dry-run plan
+  // so the user can act. (T14 finding.)
   for (const [object, attrs] of graph.nodes) {
     if (inScope !== undefined && !inScope.has(object)) continue;
     for (const sf of attrs.sensitiveFields) {
+      if (!MASKABLE_FIELD_TYPES.has(sf.type)) continue;
       ensure(object).set(sf.name, "auto");
     }
   }

@@ -35,6 +35,20 @@ describe("resolveMaskSelection — T8 simple defaults + overrides", () => {
     expect(sel.get("Contact")?.get("Phone")).toBe("auto");
   });
 
+  it("default selection includes only maskable text types (skips boolean/picklist/date) — T14", () => {
+    const g = graph({
+      Contact: [
+        sf("Email", "email"),
+        sf("Do_Not_Email__c", "boolean"),
+        sf("Bad_Email_Address__c", "picklist"),
+        sf("Birthdate", "date"),
+        sf("MailingStreet", "string"),
+      ],
+    });
+    const fields = [...(resolveMaskSelection(g).get("Contact")?.keys() ?? [])].sort();
+    expect(fields).toEqual(["Email", "MailingStreet"]);
+  });
+
   it("user can ADD a field the detector missed (the G1 under-flag case)", () => {
     const sel = resolveMaskSelection(graph({ Contact: [sf("Email")] }), {
       Contact: ["FirstName"],
@@ -92,9 +106,11 @@ describe("resolveMaskSelection — T8 simple defaults + overrides", () => {
   });
 
   it("scoping also drops user overrides for out-of-scope objects", () => {
-    const sel = resolveMaskSelection(graph({ Contact: [sf("Email")] }), { NotSeeded__c: ["Foo__c"] }, [
-      "Contact",
-    ]);
+    const sel = resolveMaskSelection(
+      graph({ Contact: [sf("Email")] }),
+      { NotSeeded__c: ["Foo__c"] },
+      ["Contact"],
+    );
     expect(sel.has("NotSeeded__c")).toBe(false);
     expect(sel.get("Contact")?.get("Email")).toBe("auto");
   });

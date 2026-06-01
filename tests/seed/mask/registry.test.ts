@@ -75,12 +75,34 @@ describe("createMasker — selection & fail-closed", () => {
     expect(m.apply({ object: "C", field: field("E", "email"), value: "" })).toBe("");
   });
 
-  it("fails closed on a non-string value (invariant #5)", () => {
+  it("copies a non-string value through unchanged — no row drop (T14 fix)", () => {
     const m = createMasker({ salt, selection: sel([["C", [["N", "generic-text"]]]]) });
-    expect(m.apply({ object: "C", field: field("N", "double"), value: 42 })).toBe(OMIT_ROW);
+    expect(m.apply({ object: "C", field: field("N", "double"), value: 42 })).toBe(42);
   });
 
-  it("fails closed on an unselected field", () => {
+  it("copies a non-maskable field TYPE through unchanged (picklist/boolean/date)", () => {
+    const m = createMasker({
+      salt,
+      selection: sel([
+        [
+          "C",
+          [
+            ["S", "auto"],
+            ["B", "auto"],
+            ["D", "auto"],
+          ],
+        ],
+      ]),
+    });
+    // Text-masking these would break the insert (bad picklist, non-date) — copy.
+    expect(m.apply({ object: "C", field: field("S", "picklist"), value: "Open" })).toBe("Open");
+    expect(m.apply({ object: "C", field: field("B", "boolean"), value: true })).toBe(true);
+    expect(m.apply({ object: "C", field: field("D", "date"), value: "1990-01-01" })).toBe(
+      "1990-01-01",
+    );
+  });
+
+  it("fails closed (OMIT_ROW) on an unselected field", () => {
     const m = createMasker({ salt, selection: sel([["C", [["E", "email"]]]]) });
     expect(m.apply({ object: "C", field: field("Other"), value: "x" })).toBe(OMIT_ROW);
   });
