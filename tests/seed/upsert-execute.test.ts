@@ -230,6 +230,71 @@ describe("runExecute — UPSERT routing", () => {
     await rm(tmp, { recursive: true, force: true });
   });
 
+  it("error path: a batch DML rejection body never reaches the caller (AI boundary)", async () => {
+    // Highest-value leak vector: a batch-level (non-2xx) composite INSERT
+    // failure whose Salesforce body echoes record data. compositeInsert throws
+    // and the error propagates out of runExecute to the MCP layer, which
+    // serializes `.message` to the model. It must carry only the errorCode.
+    const plantedId = "003TGT000000999AAA";
+    const plantedValue = "alice-ssn@secret.example";
+    const sourceRecords = [{ Id: "003SRC000000001AAA", LastName: "Alice", SSN__c: "111-11-1111" }];
+    const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const method = init?.method ?? "GET";
+      if (url.includes("/query?q=")) {
+        const isIdOnly = !url.includes("%2C") && !url.includes(",");
+        return {
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          json: async () => ({
+            done: true,
+            records: isIdOnly ? sourceRecords.map((r) => ({ Id: r.Id })) : sourceRecords,
+          }),
+        } as unknown as Response;
+      }
+      if (method === "POST" && url.endsWith("/composite/sobjects")) {
+        return {
+          ok: false,
+          status: 400,
+          statusText: "Bad Request",
+          text: async () =>
+            JSON.stringify([
+              {
+                message: `duplicate value found: SSN__c duplicates record ${plantedId} (${plantedValue})`,
+                errorCode: "DUPLICATE_VALUE",
+              },
+            ]),
+        } as unknown as Response;
+      }
+      throw new Error(`unexpected fetch: ${method} ${url}`);
+    }) as unknown as typeof fetch;
+
+    const desc = fakeDescribeClient({ Contact: mkContactDescribe() });
+    let message: string | null = null;
+    try {
+      await runExecute({
+        sourceAuth: mkAuth("src"),
+        targetAuth: mkAuth("tgt"),
+        sourceDescribe: desc,
+        targetDescribe: desc,
+        graph: mkGraph(),
+        rootObject: "Contact",
+        whereClause: "Id != null",
+        finalObjectList: ["Contact"],
+        loadPlan: mkLoadPlan(),
+        sessionDir: tmp,
+        fetchFn,
+      });
+    } catch (e) {
+      message = (e as Error).message;
+    }
+    expect(message).not.toBeNull();
+    expect(message).toContain("DUPLICATE_VALUE"); // safe enum surfaced
+    expect(message).not.toContain(plantedId); // target record ID NOT leaked
+    expect(message).not.toContain(plantedValue); // field value NOT leaked
+  });
+
   it("routes records with a populated ext-id through PATCH composite/sobjects/<obj>/<field>", async () => {
     const sourceRecords = [
       { Id: "003SRC000000001AAA", LastName: "Alice", SSN__c: "111-11-1111" },

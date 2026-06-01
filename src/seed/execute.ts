@@ -4,7 +4,7 @@ import type { OrgAuth } from "../auth/sf-auth.ts";
 import type { DescribeClient } from "../describe/client.ts";
 import type { Field, SObjectDescribe } from "../describe/types.ts";
 import { isReference } from "../describe/types.ts";
-import { ApiError, UserError } from "../errors.ts";
+import { ApiError, salesforceErrorSummary, UserError } from "../errors.ts";
 import type { DependencyGraph } from "../graph/build.ts";
 import type { LoadPlan, LoadStep } from "../graph/order.ts";
 import { isStandardRootObject } from "../graph/standard-objects.ts";
@@ -1405,8 +1405,11 @@ async function compositeUpsert(args: {
 
   if (!res.ok) {
     const body = await safeText(res);
+    // Batch-level DML failure: the body can echo record field values
+    // (DUPLICATE_VALUE, validation-rule text). Surface code only. Per-record
+    // failures (HTTP 200 + errors[]) are logged to execute.log on disk.
     throw new ApiError(
-      `composite/sobjects/${args.object}/${args.externalIdField} PATCH failed (${res.status}): ${body}`,
+      `composite/sobjects/${args.object}/${args.externalIdField} PATCH failed: ${salesforceErrorSummary(res.status, res.statusText, body)}`,
     );
   }
   try {
@@ -1438,7 +1441,9 @@ async function compositeInsert(args: {
 
   if (!res.ok) {
     const body = await safeText(res);
-    throw new ApiError(`composite/sobjects POST failed (${res.status}): ${body}`);
+    throw new ApiError(
+      `composite/sobjects POST failed: ${salesforceErrorSummary(res.status, res.statusText, body)}`,
+    );
   }
   try {
     return (await res.json()) as CompositeResult[];
@@ -1466,7 +1471,9 @@ async function patchRecord(args: {
   });
   if (!res.ok && res.status !== 204) {
     const body = await safeText(res);
-    throw new ApiError(`PATCH ${args.object}/${args.targetId} failed (${res.status}): ${body}`);
+    throw new ApiError(
+      `PATCH ${args.object}/${args.targetId} failed: ${salesforceErrorSummary(res.status, res.statusText, body)}`,
+    );
   }
 }
 

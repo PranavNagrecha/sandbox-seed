@@ -1,5 +1,5 @@
 import type { OrgAuth } from "../auth/sf-auth.ts";
-import { ApiError, UserError } from "../errors.ts";
+import { ApiError, salesforceErrorSummary, UserError } from "../errors.ts";
 import { salesforceFetch } from "../salesforce-fetch.ts";
 import type { DescribeCache } from "./cache.ts";
 import type { GlobalDescribe, SObjectDescribe } from "./types.ts";
@@ -84,7 +84,7 @@ export class DescribeClient {
     if (!res.ok) {
       const body = await safeText(res);
       throw new ApiError(
-        `Salesforce API error ${res.status} ${res.statusText} at ${redact(url)}.\n${body}`,
+        `Salesforce API error at ${redact(url)}: ${salesforceErrorSummary(res.status, res.statusText, body)}`,
       );
     }
 

@@ -33,7 +33,7 @@ export const AI_BOUNDARY: AiBoundaryPayload = {
     "Anything from a generic REST passthrough — we do not expose one",
   ],
   enforcement:
-    "Server source is grep-auditable: only SELECT COUNT() exists, only when includeCounts:true. A unit test fails CI if any tool handler returns a key named Id, records, or a value shaped like a record payload.",
+    "Server source is grep-auditable: full SELECTs run only to write rows to disk under ~/.sandbox-seed — their results are never returned. Only SELECT COUNT() aggregates surface, and only when includeCounts:true. A CI test (tests/mcp/ai-boundary.test.ts) fails if any tool handler's return value, OR any Salesforce error message it propagates, contains an Id/records/attributes key or an ID-shaped string.",
   whyNoExecuteSoql:
     "SOQL results are record data. Streaming rows through an LLM defeats the AI-safe positioning this tool exists for. If you need counts, use sandbox_seed_check_row_counts. If you need structure, use sandbox_seed_inspect_object. If you genuinely need rows, use the sf CLI directly — a human-in-the-loop surface where your data isn't being embedded into an LLM context window.",
   contrastWithGeneralPurposeMcps: [

@@ -1,6 +1,6 @@
 import type { OrgAuth } from "../auth/sf-auth.ts";
 import type { DependencyGraph, EdgeAttrs } from "../graph/build.ts";
-import { ApiError, UserError } from "../errors.ts";
+import { ApiError, salesforceErrorSummary, UserError } from "../errors.ts";
 import { salesforceFetch } from "../salesforce-fetch.ts";
 
 /**
@@ -26,8 +26,10 @@ export async function queryCount(opts: {
 
   const body = await queryAll(opts.auth, soql, opts.fetchFn);
   if (typeof body.totalSize === "number") return body.totalSize;
+  // Do NOT echo `body` — a COUNT envelope shouldn't carry rows, but an
+  // unexpected response might; keep record data off the model-facing error.
   throw new ApiError(
-    `Unexpected response to COUNT query on ${opts.object}: ${JSON.stringify(body)}`,
+    `Unexpected response to COUNT query on ${opts.object} (response had no numeric totalSize).`,
   );
 }
 
@@ -337,8 +339,10 @@ async function doGet(
   }
   if (!res.ok) {
     const body = await safeText(res);
+    // Surface status + errorCode enum only — never the raw body, whose
+    // `message` field can contain record values. (AI-data boundary.)
     throw new ApiError(
-      `Salesforce API error ${res.status} ${res.statusText}.\n${body}`,
+      `Salesforce API error: ${salesforceErrorSummary(res.status, res.statusText, body)}`,
     );
   }
 
