@@ -19,6 +19,8 @@ import {
   soqlIdList,
 } from "./extract.ts";
 import { IdMap } from "./id-map.ts";
+import { createMasker } from "./mask/registry.ts";
+import { type MaskSelection, type Masker, OMIT_ROW } from "./mask/types.ts";
 import { ProjectIdMap, type TargetIdentity } from "./project-id-map.ts";
 import type { ExecuteSummary, UpsertDecisionSummary } from "./session.ts";
 import { reactivateFromSnapshot, snapshotAndDeactivate } from "./validation-rule-toggle.ts";
@@ -115,6 +117,16 @@ export type ExecuteOptions = {
    * sample.
    */
   sampledRootIds?: string[];
+  /**
+   * Optional field masking. When set, scalar (non-reference) values for the
+   * fields named in `selection` are replaced with deterministic, keyed,
+   * format-preserving fakes before insert (see src/seed/mask). Absent ⇒ values
+   * are copied verbatim — byte-identical to pre-masking behavior. The salt
+   * makes masking reproducible across runs (UPSERT idempotence) and is never
+   * logged or returned. Reference fields are NEVER masked — the id-map owns
+   * FK remapping.
+   */
+  masking?: { salt: string; selection: MaskSelection };
 };
 
 const BATCH_SIZE = 200;
@@ -128,6 +140,11 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteSummary> 
   await writeFile(logPath, "", "utf8");
   const idMap = new IdMap(idMapPath);
   await idMap.load();
+
+  // Construct the masker once if masking is configured. Off ⇒ undefined, and
+  // rewriteRecordForTarget then copies scalar values verbatim — no behavior
+  // change from pre-masking. (src/seed/mask)
+  const masker = opts.masking !== undefined ? createMasker(opts.masking) : undefined;
 
   // Layer the persistent project-level map UNDER the session-local one,
   // so prior runs' source→target mappings are reused (cross-run FK
@@ -278,6 +295,7 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteSummary> 
           rootIds,
           appendLog,
           projectMapLoadedByTargetId,
+          masker,
         });
         insertedCounts[object] = res.inserted;
         errorCount += res.errors;
@@ -298,6 +316,7 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteSummary> 
           scopePaths,
           appendLog,
           projectMapLoadedByTargetId,
+          masker,
         });
         for (const [o, n] of Object.entries(res.inserted)) {
           insertedCounts[o] = (insertedCounts[o] ?? 0) + n;
@@ -387,9 +406,19 @@ async function seedSingle(args: {
   rootIds: string[];
   appendLog: (msg: string) => Promise<void>;
   projectMapLoadedByTargetId: Map<string, { object: string; sourceId: string }>;
+  masker: Masker | undefined;
 }): Promise<{ inserted: number; errors: number; alreadySeeded: number }> {
-  const { object, scopes, opts, fetchFn, idMap, rootIds, appendLog, projectMapLoadedByTargetId } =
-    args;
+  const {
+    object,
+    scopes,
+    opts,
+    fetchFn,
+    idMap,
+    rootIds,
+    appendLog,
+    projectMapLoadedByTargetId,
+    masker,
+  } = args;
 
   const srcDescribe = await opts.sourceDescribe.describeObject(object);
   const allCreateable = pickCreateableFields(srcDescribe);
@@ -501,7 +530,7 @@ async function seedSingle(args: {
         alreadySeededInChunk++;
         continue;
       }
-      const rewritten = rewriteRecordForTarget(object, rec, createable, idMap);
+      const rewritten = rewriteRecordForTarget(object, rec, createable, idMap, masker);
       if (rewritten === null) continue;
 
       if (upsertField !== null) {
@@ -629,9 +658,19 @@ async function seedCycle(args: {
   scopePaths: Map<string, ScopePath[]>;
   appendLog: (msg: string) => Promise<void>;
   projectMapLoadedByTargetId: Map<string, { object: string; sourceId: string }>;
+  masker: Masker | undefined;
 }): Promise<{ inserted: Record<string, number>; errors: number }> {
-  const { step, opts, fetchFn, idMap, rootIds, scopePaths, appendLog, projectMapLoadedByTargetId } =
-    args;
+  const {
+    step,
+    opts,
+    fetchFn,
+    idMap,
+    rootIds,
+    scopePaths,
+    appendLog,
+    projectMapLoadedByTargetId,
+    masker,
+  } = args;
 
   if (step.breakEdge === null) {
     await appendLog(`SKIP cycle ${step.objects.join(",")}: no nillable break edge available.`);
@@ -752,7 +791,7 @@ async function seedCycle(args: {
       const upsertRewrites: Array<{ body: Record<string, unknown>; sourceId: string }> = [];
       const insertRewrites: Array<{ body: Record<string, unknown>; sourceId: string }> = [];
       for (const rec of chunk) {
-        const rewritten = rewriteRecordForTarget(object, rec, createable, idMap);
+        const rewritten = rewriteRecordForTarget(object, rec, createable, idMap, masker);
         if (rewritten === null) {
           errors++;
           continue;
@@ -1298,6 +1337,7 @@ function rewriteRecordForTarget(
   record: Record<string, unknown>,
   createable: Field[],
   idMap: IdMap,
+  masker: Masker | undefined,
 ): Record<string, unknown> | null {
   const body: Record<string, unknown> = { attributes: { type: object } };
   const byName = new Map<string, Field>();
@@ -1353,7 +1393,18 @@ function rewriteRecordForTarget(
       continue;
     }
 
-    body[key] = value;
+    // Scalar (non-reference) leaf value. Mask it when this field is selected;
+    // otherwise copy verbatim. Fail-closed: OMIT_ROW returns null so the caller
+    // skips + logs the row rather than ever emitting the clear value. Reference
+    // fields never reach here (they `continue` above) and are double-guarded
+    // inside the masker. (masking-spec.md §3, §4.1)
+    if (masker !== undefined && !isReference(field) && masker.selects(object, field.name)) {
+      const masked = masker.apply({ object, field, value });
+      if (masked === OMIT_ROW) return null;
+      body[key] = masked;
+    } else {
+      body[key] = value;
+    }
   }
 
   return body;
