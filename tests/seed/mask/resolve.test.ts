@@ -76,6 +76,34 @@ describe("resolveMaskSelection — T8 simple defaults + overrides", () => {
   it("no sensitives and no overrides → empty selection", () => {
     expect(resolveMaskSelection(graph({ Account: [] })).size).toBe(0);
   });
+
+  it("scopes to finalObjectList — ignores the rest of the analyzed graph (T14 fix)", () => {
+    // The analyzed graph on a real org carries hundreds of related objects the
+    // run never seeds. The masking plan must cover ONLY finalObjectList.
+    const g = graph({
+      Contact: [sf("Email", "email")],
+      VoiceCall: [sf("FromPhoneNumber", "phone")],
+      sumoapp__Email__c: [sf("sumoapp__EmailAddress__c", "email")],
+    });
+    const sel = resolveMaskSelection(g, undefined, ["Contact"]);
+    expect(sel.has("Contact")).toBe(true);
+    expect(sel.has("VoiceCall")).toBe(false);
+    expect(sel.has("sumoapp__Email__c")).toBe(false);
+  });
+
+  it("scoping also drops user overrides for out-of-scope objects", () => {
+    const sel = resolveMaskSelection(graph({ Contact: [sf("Email")] }), { NotSeeded__c: ["Foo__c"] }, [
+      "Contact",
+    ]);
+    expect(sel.has("NotSeeded__c")).toBe(false);
+    expect(sel.get("Contact")?.get("Email")).toBe("auto");
+  });
+
+  it("no scope arg → whole graph (back-compat)", () => {
+    const sel = resolveMaskSelection(graph({ Contact: [sf("Email")], Lead: [sf("Email")] }));
+    expect(sel.has("Contact")).toBe(true);
+    expect(sel.has("Lead")).toBe(true);
+  });
 });
 
 describe("maskedFieldNames — T9 report/response projection", () => {

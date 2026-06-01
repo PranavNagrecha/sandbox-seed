@@ -818,7 +818,7 @@ async function doDryRun(
   // apply, resolved from the live graph + the session's maskFields. Names only.
   const maskedFieldsByObject =
     session.maskSalt !== undefined
-      ? maskedFieldNames(resolveMaskSelection(inspectResult.graph, session.maskFields))
+      ? maskedFieldNames(resolveMaskSelection(inspectResult.graph, session.maskFields, session.finalObjectList))
       : undefined;
 
   const targetIdentity = await getTargetIdentity({
@@ -1107,7 +1107,7 @@ async function doRun(
         session.maskSalt !== undefined
           ? {
               salt: session.maskSalt,
-              selection: resolveMaskSelection(inspectResult.graph, session.maskFields),
+              selection: resolveMaskSelection(inspectResult.graph, session.maskFields, session.finalObjectList),
             }
           : undefined,
     });
