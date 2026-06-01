@@ -260,18 +260,37 @@ describe("queryActiveValidationRules", () => {
     expect(rules[0].fullName).toBe("Contact.Fallback_Rule");
   });
 
-  it("surfaces phase-1 Tooling API HTTP errors as ApiError with permission hint", async () => {
+  it("surfaces phase-1 Tooling API HTTP errors as ApiError (errorCode only, no body leak)", async () => {
     const fetchFn = routingFetch(
-      [{ status: 403, body: "INSUFFICIENT_ACCESS" }],
+      [
+        {
+          status: 403,
+          // Object body — routingFetch JSON.stringifies it into the Response.
+          body: [
+            {
+              message: "No access to ValidationRule for secret-detail-xyz",
+              errorCode: "INSUFFICIENT_ACCESS",
+            },
+          ],
+        },
+      ],
       {},
     );
-    await expect(
-      queryActiveValidationRules({
+    let message: string | null = null;
+    try {
+      await queryActiveValidationRules({
         auth: fakeAuth(),
         objects: ["Contact"],
         fetchFn: fetchFn as unknown as typeof fetch,
-      }),
-    ).rejects.toThrow(/Tooling API query for ValidationRule failed \(403\)/);
+      });
+    } catch (e) {
+      message = (e as Error).message;
+    }
+    expect(message).not.toBeNull();
+    expect(message).toMatch(
+      /Tooling API query for ValidationRule failed: HTTP 403 \(INSUFFICIENT_ACCESS\)/,
+    );
+    expect(message).not.toContain("secret-detail-xyz"); // raw body message NOT leaked
   });
 
   it("surfaces phase-2 per-id GET errors as ApiError", async () => {

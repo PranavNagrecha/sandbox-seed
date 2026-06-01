@@ -1,5 +1,5 @@
 import type { OrgAuth } from "../auth/sf-auth.ts";
-import { ApiError } from "../errors.ts";
+import { ApiError, salesforceErrorSummary } from "../errors.ts";
 import { salesforceFetch } from "../salesforce-fetch.ts";
 
 /**
@@ -92,7 +92,7 @@ export async function queryActiveValidationRules(opts: {
     if (!res.ok) {
       const body = await safeText(res);
       throw new ApiError(
-        `Tooling API query for ValidationRule failed (${res.status}): ${body}`,
+        `Tooling API query for ValidationRule failed: ${salesforceErrorSummary(res.status, res.statusText, body)}`,
         `If this says INSUFFICIENT_ACCESS or INVALID_SESSION, check that the target-org user ` +
           `has Customize Application; if this says MALFORMED_QUERY, it's an internal bug — ` +
           `this client deliberately avoids selecting Metadata/FullName in the filter query.`,
@@ -140,7 +140,7 @@ export async function queryActiveValidationRules(opts: {
       const body = await safeText(res);
       throw new ApiError(
         `Tooling GET ValidationRule/${stub.id} (${stub.entityApiName}.${stub.validationName}) ` +
-          `failed (${res.status}): ${body}`,
+          `failed: ${salesforceErrorSummary(res.status, res.statusText, body)}`,
       );
     }
     const raw = (await res.json()) as Record<string, unknown>;
@@ -206,7 +206,7 @@ export async function setValidationRuleActive(opts: {
     const body = await safeText(res);
     throw new ApiError(
       `Tooling PATCH ValidationRule/${opts.rule.id} (${opts.rule.fullName}) ` +
-        `active=${opts.active} failed (${res.status}): ${body}`,
+        `active=${opts.active} failed: ${salesforceErrorSummary(res.status, res.statusText, body)}`,
     );
   }
 }

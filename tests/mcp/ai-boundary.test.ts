@@ -8,6 +8,7 @@ import { checkRowCounts } from "../../src/mcp/tools/check-row-counts.ts";
 import { describeGlobal } from "../../src/mcp/tools/describe-global.ts";
 import { describeObject } from "../../src/mcp/tools/describe-object.ts";
 import { inspectObject } from "../../src/mcp/tools/inspect-object.ts";
+import { queryCount } from "../../src/seed/extract.ts";
 import {
   ACCOUNT,
   CASE,
@@ -212,6 +213,44 @@ describe("AI-boundary enforcement", () => {
     for (const value of Object.values(result.counts)) {
       expect(value === null || typeof value === "number").toBe(true);
     }
+  });
+
+  it("error path: a Salesforce error body never reaches the model", async () => {
+    // The previously-untested leak vector. A non-2xx whose body embeds a
+    // record ID + field value in the SF `message`. queryCount -> doGet throws,
+    // and the MCP server serializes that error's `.message` back to the model.
+    // It must carry only the errorCode enum — and the SAME boundary detector
+    // that guards happy-path output must find zero violations in the message.
+    const plantedId = "0035g00000AbCdEfGHI";
+    const fetchFn = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify([
+            {
+              message: `duplicate value found: Email__c duplicates record ${plantedId} (mallory@secret.example)`,
+              errorCode: "DUPLICATE_VALUE",
+              fields: ["Email__c"],
+            },
+          ]),
+          {
+            status: 400,
+            statusText: "Bad Request",
+            headers: { "content-type": "application/json" },
+          },
+        ),
+    ) as unknown as typeof fetch;
+
+    let message: string | null = null;
+    try {
+      await queryCount({ auth: fakeAuth(), object: "Account", whereClause: "Id != null", fetchFn });
+    } catch (e) {
+      message = (e as Error).message;
+    }
+    expect(message).not.toBeNull();
+    expect(message).toContain("DUPLICATE_VALUE"); // safe enum surfaced
+    expect(message).not.toContain(plantedId); // record ID NOT leaked
+    expect(message).not.toContain("mallory@secret.example"); // field value NOT leaked
+    expect(findBoundaryViolations({ error: "ApiError", message })).toEqual([]);
   });
 
   it("the detector itself catches obvious leaks (sanity check)", () => {
