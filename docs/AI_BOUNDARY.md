@@ -122,8 +122,21 @@ If you find a path where record data flows through the MCP envelope, that's a se
 - **Not encryption.** The on-disk session store is plain JSON. Treat it like any other local data — same threat model as your `.sf/` auth files.
 - **Not a guarantee about the source org.** This tool can't stop you from running other queries through other tools. It only guarantees that *its own* tool calls don't expose row data to the AI.
 - **Not a bypass for least-privilege auth.** If your Salesforce user can see the data, the tool can extract it. Use a scoped integration user when seeding.
-- **Not a substitute for masking.** The data on disk is real. If you load it into a sandbox, the sandbox now contains real data. Sandboxes generally have weaker access controls than prod — plan for that. PII masking is on the roadmap.
+- **Masking is opt-in, not automatic.** By default the data copied to the target is real (same value in, same value out). Pass `mask: true` / `maskFields` at `start` to scrub PII on the way to the target — see [Masking](#masking) below. Without it, the target sandbox holds real data, and sandboxes generally have weaker access controls than prod.
 - **Not immune to out-of-band target deletions.** The persistent project id-map at `~/.sandbox-seed/id-maps/` caches source→target ID pairs across runs. If a target row is deleted outside this tool (manual cleanup, another data loader, a partial sandbox refresh the tool didn't observe), the map still claims the row exists and the next run that FKs to it will fail with `INVALID_CROSS_REFERENCE_KEY`. When this happens, `execute.log` flags the specific stale entries and suggests re-running with `isolateIdMap: true` once to rebuild the map from scratch.
+
+---
+
+## Masking
+
+Opt-in field masking (`mask: true` / `maskFields` at `start`) replaces sensitive values with deterministic, format-preserving fakes **before they reach the target**. How it relates to the boundary:
+
+- **Target-side scrub.** Masking changes what is inserted into the target org. Source values are read into memory, masked, and only the masked value is sent on the composite insert. The originals are **not** persisted by the run — no field values are written to `execute.log`, `dry-run.md`, or `plan.json`, and no tool response carries them.
+- **Deterministic + keyed.** The mask is `HMAC-SHA256(salt, value)` → a seeded, format-preserving fake. The salt is a 64-hex secret at `~/.sandbox-seed/id-maps/<source>__<target>.salt` (chmod 600), never logged and never returned in a response. Same salt + same value ⇒ same fake, so value joins and external-id UPSERT survive masking and re-runs are idempotent.
+- **References are never masked.** Lookups / master-detail are remapped by the id-map; the masker only touches scalar leaf values.
+- **Fail-closed.** A sensitive field the masker can't produce a value for skips the row (logged) rather than emitting the clear value.
+- **Known residual — deterministic masking is set-membership-confirmable.** Because the same input always maps to the same output under one salt, an attacker who can guess a plaintext and observe its masked form can confirm whether that value is present in the dataset. This is the deliberate price of referential consistency. For a one-shot copy where you don't need cross-run consistency, run with `isolateIdMap: true` to use an ephemeral per-session salt.
+- **Detection is a floor, not a guarantee.** Name/pattern auto-detection under-flags on real schemas — it misses first/last names, demographics, and domain-specific custom objects. The dry-run report lists exactly what will be masked; review it and add anything missed via `maskFields` before you run.
 
 ---
 
