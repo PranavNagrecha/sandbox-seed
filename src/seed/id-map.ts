@@ -13,8 +13,14 @@ import { readFile, writeFile } from "node:fs/promises";
  */
 export class IdMap {
   private readonly map = new Map<string, string>();
+  private readonly filePath: string;
 
-  constructor(private readonly filePath: string) {}
+  // NB: explicit field assignment, NOT a TS parameter property — the latter
+  // is unsupported by Node's `--experimental-strip-types`, which the
+  // `mcp:dev` / `inspect:dev` source runners rely on.
+  constructor(filePath: string) {
+    this.filePath = filePath;
+  }
 
   async load(): Promise<void> {
     try {
