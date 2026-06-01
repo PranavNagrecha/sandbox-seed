@@ -53,10 +53,23 @@ export type OptionalParentWarning = {
   object: string;
   /** API name of the required reference field on `object`. */
   fkField: string;
-  /** Object that `fkField` points to. */
+  /**
+   * Object that `fkField` points to. For a polymorphic FK this is a
+   * *representative* target (an in-scope optional object when one exists,
+   * else the first alphabetically) — the FK needs any ONE of its targets,
+   * and `requiresAnyOfCount` reports how many it can choose from.
+   */
   requiresObject: string;
   /** `optional` → user can add via `includeOptionalParents` on select. */
   requiresStatus: "optional" | "missing";
+  /**
+   * Present only when `fkField` is polymorphic (>1 possible target object).
+   * The FK is satisfied by any single one of them, so this warning is
+   * collapsed to one row regardless of how many objects the FK can address —
+   * without this, a field like `Attachment.ParentId` (hundreds of targets)
+   * would emit hundreds of warnings and blow the agent's context window.
+   */
+  requiresAnyOfCount?: number;
 };
 
 export type SeedClassification = {
@@ -282,22 +295,40 @@ export function classifyForSeed(input: ClassifyInput): SeedClassification {
   const optionalParentWarnings: OptionalParentWarning[] = [];
   for (const obj of optionalNameSet) {
     const edges = parentEdgesBySource.get(obj) ?? [];
+    // Group an object's required parent FKs BY FIELD. A polymorphic FK
+    // (e.g. Attachment.ParentId, ContentDocumentLink.LinkedEntityId,
+    // EventRelation.RelationId) surfaces here as one edge per `referenceTo`
+    // target — hundreds of them on a managed-package-heavy org. Such an FK
+    // is satisfied if ANY ONE target is in scope, so it must be evaluated
+    // as a single unit. Emitting one warning per target would be both
+    // WRONG (a polymorphic FK needs one parent, not all of them) and a
+    // context-window bomb for the agent (3k+ rows seen in the wild).
+    const byField = new Map<string, { targets: Set<string>; rootSatisfied: boolean }>();
     for (const e of edges) {
-      if (e.target === root) continue;
-      if (isStandardRootObject(e.target)) continue;
       const required = e.masterDetail || !e.nillable;
       if (!required) continue;
-      if (mustInclude.has(e.target)) continue;
-      // Same FK can appear via polymorphic referenceTo; dedupe by tuple.
-      const dup = optionalParentWarnings.find(
-        (w) => w.object === obj && w.fkField === e.fieldName && w.requiresObject === e.target,
-      );
-      if (dup !== undefined) continue;
+      const g = byField.get(e.fieldName) ?? { targets: new Set<string>(), rootSatisfied: false };
+      if (e.target === root) g.rootSatisfied = true;
+      else if (!isStandardRootObject(e.target)) g.targets.add(e.target);
+      byField.set(e.fieldName, g);
+    }
+    for (const [fkField, g] of byField) {
+      // Resolvable (no silent-skip risk) if the root is itself a target —
+      // the root is always seeded — or any target is already a must-include.
+      if (g.rootSatisfied) continue;
+      const targets = [...g.targets];
+      if (targets.length === 0) continue;
+      if (targets.some((t) => mustInclude.has(t))) continue;
+      // Prefer naming a target the user can act on (an optional object they
+      // can add via `select`) over an arbitrary one.
+      const optionalTargets = targets.filter((t) => optionalNameSet.has(t)).sort();
+      const requiresObject = optionalTargets[0] ?? [...targets].sort()[0];
       optionalParentWarnings.push({
         object: obj,
-        fkField: e.fieldName,
-        requiresObject: e.target,
-        requiresStatus: optionalNameSet.has(e.target) ? "optional" : "missing",
+        fkField,
+        requiresObject,
+        requiresStatus: optionalTargets.length > 0 ? "optional" : "missing",
+        ...(targets.length > 1 && { requiresAnyOfCount: targets.length }),
       });
     }
   }
