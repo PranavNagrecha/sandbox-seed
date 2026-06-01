@@ -82,6 +82,13 @@ export type DryRunOptions = {
    * scope it reports MATCHES what the run will process.
    */
   sampledRootIds?: string[];
+  /**
+   * Per-object field NAMES the run will mask (resolved by the caller via
+   * resolveMaskSelection + maskedFieldNames). Rendered into the report's
+   * "Masking" section and echoed in the summary. Names only — no values.
+   * Absent ⇒ masking is off for the session.
+   */
+  maskedFieldsByObject?: Record<string, string[]>;
 };
 
 export async function runDryRun(opts: DryRunOptions): Promise<DryRunSummary> {
@@ -318,6 +325,7 @@ export async function runDryRun(opts: DryRunOptions): Promise<DryRunSummary> {
       planHash,
       defaultedOwnerRefByObject: defaultedByObject,
       totalDefaultedOwnerRefs,
+      maskedFieldsByObject: opts.maskedFieldsByObject,
     }),
     "utf8",
   );
@@ -338,6 +346,7 @@ export async function runDryRun(opts: DryRunOptions): Promise<DryRunSummary> {
     defaultedOwnerRefCount: totalDefaultedOwnerRefs,
     defaultedOwnerRefByObject:
       Object.keys(defaultedByObject).length > 0 ? defaultedByObject : undefined,
+    maskedFieldsByObject: opts.maskedFieldsByObject,
   };
 }
 
@@ -555,6 +564,7 @@ function renderReport(args: {
   planHash: string;
   defaultedOwnerRefByObject: Record<string, number>;
   totalDefaultedOwnerRefs: number;
+  maskedFieldsByObject?: Record<string, string[]>;
 }): string {
   const lines: string[] = [];
   lines.push(`# Sandbox-seed dry run`);
@@ -578,6 +588,27 @@ function renderReport(args: {
   lines.push(``);
   lines.push(`**Total records in scope: ${total}**`);
   lines.push(``);
+
+  const masked = args.maskedFieldsByObject;
+  if (masked !== undefined && Object.values(masked).some((f) => f.length > 0)) {
+    lines.push(`## Masking`);
+    lines.push(``);
+    lines.push(
+      `These field VALUES will be replaced with deterministic, format-preserving ` +
+        `fakes before insert. **Review carefully** — auto-detection can MISS PII ` +
+        `(first/last names, demographics, whole custom objects). Add anything it ` +
+        `missed by re-running \`start\` with \`maskFields\`.`,
+    );
+    lines.push(``);
+    lines.push(`| Object | Masked fields |`);
+    lines.push(`| --- | --- |`);
+    for (const obj of args.finalObjectList) {
+      const fields = masked[obj];
+      if (fields === undefined || fields.length === 0) continue;
+      lines.push(`| \`${obj}\` | ${fields.map((f) => `\`${f}\``).join(", ")} |`);
+    }
+    lines.push(``);
+  }
 
   lines.push(`## SOQL per object`);
   lines.push(``);
@@ -689,4 +720,4 @@ function renderReport(args: {
 
 // Referenced but not used — kept for symmetry with execute.ts. If a caller
 // wants to sanity-check the chunking math, they can import this.
-export { chunkIds as _chunkIds, soqlIdList as _soqlIdList };
+export { chunkIds as _chunkIds, renderReport as _renderReport, soqlIdList as _soqlIdList };

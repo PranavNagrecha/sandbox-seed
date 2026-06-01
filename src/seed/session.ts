@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { UserError } from "../errors.ts";
+import type { UserMaskFields } from "./mask/resolve.ts";
 
 /**
  * Session state for the agentic seed flow.
@@ -98,6 +99,12 @@ export type DryRunSummary = {
   defaultedOwnerRefCount?: number;
   /** Per-object breakdown of `defaultedOwnerRefCount`. */
   defaultedOwnerRefByObject?: Record<string, number>;
+  /**
+   * Per-object list of field NAMES that `run` will mask (the resolved
+   * selection). Names only — metadata, AI-boundary safe. Absent when masking
+   * is off for the session.
+   */
+  maskedFieldsByObject?: Record<string, string[]>;
 };
 
 export type ExecuteSummary = {
@@ -224,6 +231,17 @@ export type Session = {
    * details out of the LLM response payload.
    */
   upsertKeyConflicts?: Record<string, { candidateCount: number }>;
+  /**
+   * Field masking for this session. `maskSalt` present ⇒ masking is ON: at
+   * `run`, scalar values for the resolved selection are replaced with
+   * deterministic, keyed, format-preserving fakes. The salt is generated once
+   * at `start` (CSPRNG) and NEVER returned in any tool response — it lives only
+   * in session.json on disk. `maskFields` carries the user's add/pin/opt-out
+   * instructions (field NAMES only). Selection = detector `sensitiveFields` ∪
+   * overrides, resolved at run by `resolveMaskSelection`. See src/seed/mask.
+   */
+  maskSalt?: string;
+  maskFields?: UserMaskFields;
   /** If the user retries a step after an error, the last error is stored here. */
   lastError?: string;
 };

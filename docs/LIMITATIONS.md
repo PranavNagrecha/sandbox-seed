@@ -30,7 +30,7 @@ For the overall scope of the 0.2.x line and the AI-boundary contract, see the [R
 
 **Source-only fields are silently dropped.** Any field present on the source object but not the target object is excluded from the insert body. The dry-run report lists dropped field names per object; execute.log repeats the count. No rename, no manual override — if the target schema is missing a field, that column is not copied.
 
-**No field transforms.** There is no hook to rewrite, mask, or compute values mid-flow. Source value in, identical value out (except for FK id rewrites).
+**Masking yes; other field transforms no.** Opt-in field **masking** is supported — pass `mask: true` / `maskFields` at `start` to replace PII with deterministic, format-preserving fakes (see [AI_BOUNDARY.md](AI_BOUNDARY.md#masking)). There is still no general hook to *rewrite*, *compute*, or *derive* non-masking values mid-flow; outside masked fields, source value in, identical value out (except FK id rewrites).
 
 **Record types are matched by `DeveloperName`.** When both source and target have record types on an object, the tool matches them by `DeveloperName` and pre-populates the id-map. If the DeveloperNames don't match across orgs, the field is omitted on insert and Salesforce's default-picker fills from the running user. There is no fallback match by label or by ID.
 
@@ -83,7 +83,7 @@ See [AI_BOUNDARY.md](AI_BOUNDARY.md) for the full contract.
 ## What's on the roadmap, not shipped
 
 - Synthetic data generation
-- PII masking / field-level transforms
+- Field-level transforms beyond masking (compute / derive / rename)
 - CSV import as an alternative to live SOQL
 - Multi-target fan-out (seed one source into N sandboxes in one flow)
 - Bulk API v2 for large volumes

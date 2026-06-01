@@ -155,8 +155,9 @@ Then for each subsequent step, paste back the JSON the agent suggests:
 - **Semi-joins in `whereClause` now supported** (fixed in 0.2.0) — root predicates like `Id IN (SELECT … FROM …)` work end-to-end. Root IDs are materialized once and spliced into downstream scopes as literal `Id IN ('…','…')`, sidestepping SOQL's one-level semi-join limit.
 - **CLI `inspect` command** — read-only schema and dependency-graph exploration (tree / mermaid / dot / json).
 - Salesforce CLI auth integration (reads `~/.sf/`).
+- **Deterministic field masking** (opt-in) — pass `mask: true` (and/or `maskFields`) at `start` to replace PII with deterministic, format-preserving fakes before insert (emails stay email-shaped, phones phone-shaped, …). Keyed by a per-(source, target) salt, so the same value masks identically everywhere and across re-runs — value joins and external-id UPSERT survive. Detected sensitive fields mask by default; the dry-run report lists exactly what will mask so you can add anything auto-detection missed. Reference fields are never masked (the id-map owns FKs). See [docs/AI_BOUNDARY.md](docs/AI_BOUNDARY.md#masking).
 
-Not yet shipped: synthetic data generation, PII masking, CSV import, multi-target fan-out. These are roadmap, not 0.2.0.
+Not yet shipped: synthetic data generation, CSV import, multi-target fan-out. These are roadmap.
 
 ### Scope & limitations to know about in 0.2.0
 

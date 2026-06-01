@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
@@ -15,6 +16,8 @@ import { classifyForSeed } from "../../seed/classify.ts";
 import { runDryRun } from "../../seed/dry-run.ts";
 import { runExecute } from "../../seed/execute.ts";
 import { queryCount, queryIds, validateWhereClause } from "../../seed/extract.ts";
+import { maskedFieldNames, resolveMaskSelection } from "../../seed/mask/resolve.ts";
+import { loadOrCreateSalt } from "../../seed/mask/salt.ts";
 import { buildCanonicalPlan, hashCanonicalPlan } from "../../seed/plan-hash.ts";
 import {
   DRY_RUN_FRESHNESS_MS,
@@ -176,6 +179,48 @@ export const SeedArgs = z.object({
         "(e.g. the auto-pick chose wrong on a prior run). Invalid overrides " +
         "(field not on source / not upsert-eligible) surface as ambiguous " +
         "at dry_run; INSERT-with-recovery handles the rest.",
+    ),
+  mask: z
+    .boolean()
+    .optional()
+    .describe(
+      "For action=start. When true, `run` masks the analyzer's detected " +
+        "sensitive fields with deterministic, format-preserving fakes before " +
+        "insert (emails stay email-shaped, phones phone-shaped, …). The same " +
+        "input always masks to the same output, so value joins and re-runs " +
+        "stay consistent. Off by default. Refine with `maskFields`.",
+    ),
+  maskFields: z
+    .record(
+      z.string().min(1),
+      z
+        .array(
+          z.union([
+            z.string().min(1),
+            z.object({
+              field: z.string().min(1),
+              strategy: z.enum([
+                "email",
+                "phone",
+                "person-name",
+                "street-address",
+                "generic-text",
+                "auto",
+                "copy",
+              ]),
+            }),
+          ]),
+        )
+        .min(1),
+    )
+    .optional()
+    .describe(
+      "For action=start. Per-object masking overrides (implies mask=true). " +
+        "Key = object API name; value = a list of either a field NAME (masked " +
+        "with an auto-picked strategy) or {field, strategy}. strategy 'copy' " +
+        "opts a field OUT. Field NAMES only, never values. Use it to add " +
+        "fields the detector missed (names, demographics, custom objects) or " +
+        "to pin/disable a specific field.",
     ),
 });
 
@@ -391,6 +436,23 @@ async function doStart(
     );
   }
 
+  // Masking opt-in: `mask: true` or any `maskFields` turns it on. The salt is a
+  // SECRET — held only in session.json (and, when persistent, beside the
+  // project id-map); never logged or returned in a response.
+  //
+  // Persistent per-(source,target) salt keeps masking consistent across runs,
+  // so re-seeds are idempotent and external-id UPSERT keeps matching. With
+  // `isolateIdMap` we use an ephemeral per-session salt instead — a clean,
+  // unshared slate that matches the isolate semantics. (masking-spec.md §4.5)
+  const maskEnabled = args.mask === true || args.maskFields !== undefined;
+  let maskSalt: string | undefined;
+  if (maskEnabled) {
+    maskSalt =
+      args.isolateIdMap === true
+        ? randomBytes(32).toString("hex")
+        : await loadOrCreateSalt({ sourceAlias: args.sourceOrg!, targetAlias: args.targetOrg! });
+  }
+
   const session = await store.create({
     sourceOrg: args.sourceOrg!,
     targetOrg: args.targetOrg!,
@@ -403,6 +465,8 @@ async function doStart(
     isolateIdMap: args.isolateIdMap === true,
     upsertKeyOverrides: args.upsertKeyOverrides,
     sampledRootIds,
+    maskSalt,
+    maskFields: maskEnabled ? args.maskFields : undefined,
   });
 
   const sampleApplied = sampledRootIds !== undefined;
@@ -420,6 +484,7 @@ async function doStart(
       limit,
       sampleApplied,
       disableValidationRulesOnRun: session.disableValidationRulesOnRun === true,
+      maskEnabled,
       childLookups: session.childLookups ?? {},
     },
     nextAction: "analyze",
@@ -749,6 +814,13 @@ async function doDryRun(
     requestedObjects: session.finalObjectList,
   });
 
+  // Masking plan for the report + response: the SAME selection `run` will
+  // apply, resolved from the live graph + the session's maskFields. Names only.
+  const maskedFieldsByObject =
+    session.maskSalt !== undefined
+      ? maskedFieldNames(resolveMaskSelection(inspectResult.graph, session.maskFields))
+      : undefined;
+
   const targetIdentity = await getTargetIdentity({
     auth: targetAuth,
     fetchFn: overrides.fetchFn,
@@ -773,6 +845,7 @@ async function doDryRun(
     isolateIdMap: session.isolateIdMap === true,
     upsertKeyOverrides: session.upsertKeyOverrides,
     sampledRootIds: session.sampledRootIds,
+    maskedFieldsByObject,
   });
 
   // If this session opted into deactivating target-org validation rules
@@ -851,6 +924,15 @@ async function doDryRun(
     summaryOut.alreadySeededCounts = summary.alreadySeededCounts;
     const totalAlready = Object.values(summary.alreadySeededCounts).reduce((a, b) => a + b, 0);
     summaryOut.totalAlreadySeeded = totalAlready;
+  }
+  if (summary.maskedFieldsByObject !== undefined) {
+    // Field NAMES only — metadata, AI-boundary safe. Lets the user review the
+    // masking plan in chat and add anything auto-detection missed.
+    summaryOut.maskedFieldsByObject = summary.maskedFieldsByObject;
+    summaryOut.maskedFieldCount = Object.values(summary.maskedFieldsByObject).reduce(
+      (a, b) => a + b.length,
+      0,
+    );
   }
   if (summary.projectIdMapPath !== undefined) {
     summaryOut.projectIdMapPath = summary.projectIdMapPath;
@@ -1021,6 +1103,13 @@ async function doRun(
       targetIdentity,
       isolateIdMap: session.isolateIdMap === true,
       sampledRootIds: session.sampledRootIds,
+      masking:
+        session.maskSalt !== undefined
+          ? {
+              salt: session.maskSalt,
+              selection: resolveMaskSelection(inspectResult.graph, session.maskFields),
+            }
+          : undefined,
     });
   } catch (err) {
     session.lastError = err instanceof Error ? err.message : String(err);
