@@ -1,3 +1,5 @@
+import { writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { z } from "zod";
 import type { OrgAuth } from "../../auth/sf-auth.ts";
 import { resolveAuth } from "../../auth/sf-auth.ts";
@@ -499,11 +501,32 @@ async function doAnalyze(
         `re-run with \`includeManagedPackages: true\` or \`includeSystemChildren: true\` to see them)`
       : "";
 
+  // AI-safety: never dump an unbounded array into the model's context.
+  // Same discipline as `loadOrder` above — full set to disk, capped sample
+  // inline. The polymorphic-FK collapse in classifyForSeed keeps this small
+  // on most orgs, but a wide schema can still produce a long *legitimate*
+  // list, so we hard-cap what the agent sees and spill the rest to a file.
+  const WARNING_INLINE_CAP = 25;
+  const allWarnings = classification.optionalParentWarnings;
+  const inlineWarnings = allWarnings.slice(0, WARNING_INLINE_CAP);
+  let optionalParentWarningsPath: string | undefined;
+  if (allWarnings.length > WARNING_INLINE_CAP) {
+    optionalParentWarningsPath = join(
+      store.sessionDir(session.id),
+      "optional-parent-warnings.json",
+    );
+    await writeFile(optionalParentWarningsPath, JSON.stringify(allWarnings, null, 2), "utf8");
+  }
+
   const warningHint =
-    classification.optionalParentWarnings.length > 0
-      ? ` Heads-up: ${classification.optionalParentWarnings.length} optional object(s) carry required FKs to ` +
-        `non-included parents — picking them without the required parent will silently skip records at run time. ` +
-        `See \`optionalParentWarnings\` in the summary.`
+    allWarnings.length > 0
+      ? ` Heads-up: ${allWarnings.length} required-FK relationship(s) on optional objects point to ` +
+        `parents not in scope — selecting those objects without their required parent will silently ` +
+        `skip records at run time.` +
+        (optionalParentWarningsPath
+          ? ` Showing the first ${WARNING_INLINE_CAP} in \`optionalParentWarnings\`; ` +
+            `full list at \`optionalParentWarningsPath\`.`
+          : ` See \`optionalParentWarnings\` in the summary.`)
       : "";
 
   return {
@@ -527,7 +550,9 @@ async function doAnalyze(
       })),
       childLookups: session.childLookups ?? {},
       childLookupTargets: result.childLookupTargets,
-      optionalParentWarnings: classification.optionalParentWarnings,
+      optionalParentWarnings: inlineWarnings,
+      optionalParentWarningsTotal: allWarnings.length,
+      ...(optionalParentWarningsPath && { optionalParentWarningsPath }),
     },
     nextAction: "select",
     guidance:

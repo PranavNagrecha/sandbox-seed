@@ -535,4 +535,115 @@ describe("classifyForSeed — optionalParentWarnings", () => {
     });
     expect(r.optionalParentWarnings).toEqual([]);
   });
+
+  it("collapses a polymorphic FK to ONE warning, not one-per-target", () => {
+    // Note.ParentId is polymorphic: one parent edge per referenceTo target.
+    // None of its targets is in scope here, so it must yield exactly ONE
+    // warning carrying requiresAnyOfCount — never one row per target. This
+    // is the fan-out that produced 3,000+ bogus warnings on a real HED org.
+    const polyTargets = ["Charlie__c", "Alpha__c", "Delta__c", "Bravo__c"];
+    const g = graph(
+      ["Root__c", "Note", ...polyTargets],
+      [
+        ...polyTargets.map((t) => parentEdge("Note", t, "ParentId", { nillable: false })),
+        {
+          source: "Note",
+          target: "Root__c",
+          fieldName: "RootId__c",
+          nillable: true,
+          custom: true,
+          polymorphic: true,
+          masterDetail: false,
+          kind: "child",
+        },
+      ],
+    );
+    const r = classifyForSeed({
+      graph: g,
+      rootObject: "Root__c",
+      parentObjects: new Set(),
+      childObjects: new Set(["Note"]),
+    });
+    expect(r.optionalParentWarnings).toEqual([
+      {
+        object: "Note",
+        fkField: "ParentId",
+        requiresObject: "Alpha__c", // representative: first alphabetically
+        requiresStatus: "missing",
+        requiresAnyOfCount: 4,
+      },
+    ]);
+  });
+
+  it("emits NO warning when a polymorphic FK can point at the root (the common HED case)", () => {
+    // Attachment.ParentId references hundreds of objects INCLUDING the root
+    // being seeded. A polymorphic FK needs any ONE target, and the root is
+    // always seeded — so there is nothing to warn about. Pre-fix this same
+    // shape emitted one "missing" warning for every other target.
+    const manyTargets = Array.from({ length: 200 }, (_, i) => `Obj${i}__c`);
+    const g = graph(
+      ["hed__Application__c", "Attachment", ...manyTargets],
+      [
+        ...manyTargets.map((t) => parentEdge("Attachment", t, "ParentId", { nillable: false })),
+        parentEdge("Attachment", "hed__Application__c", "ParentId", { nillable: false }),
+        {
+          source: "Attachment",
+          target: "hed__Application__c",
+          fieldName: "ApplicationId",
+          nillable: true,
+          custom: false,
+          polymorphic: false,
+          masterDetail: false,
+          kind: "child",
+        },
+      ],
+    );
+    const r = classifyForSeed({
+      graph: g,
+      rootObject: "hed__Application__c",
+      parentObjects: new Set(),
+      childObjects: new Set(["Attachment"]),
+    });
+    expect(r.optionalParentWarnings).toEqual([]);
+  });
+
+  it("reports a polymorphic FK as 'optional' when one target is selectable", () => {
+    // RelationId can point at Account (an optional parent the user can add)
+    // among others. Prefer naming the actionable optional target, mark it
+    // optional, and collapse to a single row.
+    const g = graph(
+      ["Root__c", "EventRelation", "Account", "Misc__c"],
+      [
+        parentEdge("EventRelation", "Account", "RelationId", { nillable: false }),
+        parentEdge("EventRelation", "Misc__c", "RelationId", { nillable: false }),
+        parentEdge("Root__c", "Account", "AccountId", { nillable: true }), // Account → optional parent
+        {
+          source: "EventRelation",
+          target: "Root__c",
+          fieldName: "RootId__c",
+          nillable: true,
+          custom: true,
+          polymorphic: false,
+          masterDetail: false,
+          kind: "child",
+        },
+      ],
+    );
+    const r = classifyForSeed({
+      graph: g,
+      rootObject: "Root__c",
+      parentObjects: new Set(["Account"]),
+      childObjects: new Set(["EventRelation"]),
+    });
+    expect(r.optionalParents).toContain("Account");
+    expect(r.optionalParentWarnings).toEqual([
+      {
+        object: "EventRelation",
+        fkField: "RelationId",
+        requiresObject: "Account",
+        requiresStatus: "optional",
+        requiresAnyOfCount: 2,
+      },
+    ]);
+  });
 });
