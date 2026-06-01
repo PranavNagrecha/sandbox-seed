@@ -34,7 +34,15 @@ export type UserMaskFields = Record<string, MaskFieldSpec[]>;
 export function resolveMaskSelection(
   graph: DependencyGraph,
   userMaskFields?: UserMaskFields,
+  scopeObjects?: Iterable<string>,
 ): MaskSelection {
+  // Restrict to the objects actually being seeded (finalObjectList). Without
+  // it the selection spans the entire ANALYZED graph — on a real
+  // managed-package org that's hundreds of related objects the run never
+  // touches, which made the dry-run masking plan wildly over-report (192
+  // fields across dozens of objects for a single-object seed). Caught by the
+  // T14 real-org dry-run.
+  const inScope = scopeObjects !== undefined ? new Set(scopeObjects) : undefined;
   const selection: MaskSelection = new Map();
   const ensure = (object: string): Map<string, MaskStrategy> => {
     const existing = selection.get(object);
@@ -44,8 +52,9 @@ export function resolveMaskSelection(
     return created;
   };
 
-  // 1. Defaults: every detector-flagged sensitive field → "auto".
+  // 1. Defaults: every detector-flagged sensitive field → "auto" (in scope).
   for (const [object, attrs] of graph.nodes) {
+    if (inScope !== undefined && !inScope.has(object)) continue;
     for (const sf of attrs.sensitiveFields) {
       ensure(object).set(sf.name, "auto");
     }
@@ -54,6 +63,7 @@ export function resolveMaskSelection(
   // 2. User overrides: add a field, pin a strategy, or opt out with "copy".
   if (userMaskFields !== undefined) {
     for (const [object, specs] of Object.entries(userMaskFields)) {
+      if (inScope !== undefined && !inScope.has(object)) continue;
       const fields = ensure(object);
       for (const spec of specs) {
         if (typeof spec === "string") {
