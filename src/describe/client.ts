@@ -1,8 +1,18 @@
 import type { OrgAuth } from "../auth/sf-auth.ts";
 import { ApiError, salesforceErrorSummary, UserError } from "../errors.ts";
 import { salesforceFetch } from "../salesforce-fetch.ts";
+import { mapWithConcurrency } from "../util/concurrency.ts";
 import type { DescribeCache } from "./cache.ts";
 import type { GlobalDescribe, SObjectDescribe } from "./types.ts";
+
+/**
+ * How many describe calls we keep in flight at once. Describes are cheap,
+ * read-only REST GETs; Salesforce tolerates modest parallelism fine, and
+ * `salesforceFetch` already backs off on 429/503. 6 cuts a 30–90s cold
+ * walk on managed-package-heavy orgs to roughly the latency of the
+ * slowest level of the BFS, without tripping concurrent-request limits.
+ */
+export const DESCRIBE_CONCURRENCY = 6;
 
 export type DescribeClientOptions = {
   auth: OrgAuth;
@@ -53,12 +63,19 @@ export class DescribeClient {
     return normalized;
   }
 
-  /** Describe many objects. Sequential — Salesforce throttles parallel describes anyway. */
+  /**
+   * Describe many objects with bounded parallelism (DESCRIBE_CONCURRENCY).
+   * The result Map preserves input order. Cache hits short-circuit before
+   * any HTTP; transient 429/503 are retried inside salesforceFetch.
+   */
   async describeMany(names: string[]): Promise<Map<string, SObjectDescribe>> {
+    const results = await mapWithConcurrency(names, DESCRIBE_CONCURRENCY, (name) =>
+      this.describeObject(name),
+    );
     const out = new Map<string, SObjectDescribe>();
-    for (const name of names) {
-      out.set(name, await this.describeObject(name));
-    }
+    names.forEach((name, i) => {
+      out.set(name, results[i]!);
+    });
     return out;
   }
 

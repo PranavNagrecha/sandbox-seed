@@ -52,7 +52,7 @@ See [AUTH.md](AUTH.md) for setup details.
 
 ## Performance
 
-**Describes are sequential.** The describe cache is TTL-bounded (24h default) and per-object, but cold-cache walks against a managed-package-heavy org issue one describe per object in sequence. Full-graph analyze against a complex Case or Opportunity hierarchy can take 30–90 seconds on first run.
+**Describe parallelism is fixed, not adaptive.** Cold-cache walks fan describes out 6 at a time per BFS level (with 429/503 backoff), which brings full-graph analyze on a complex Case or Opportunity hierarchy down to roughly 5–20 seconds on first run. The concurrency is a fixed constant — it does not adapt to org limits or get faster on orgs that could tolerate more.
 
 **Extract queries are per-object, not parallelized.** The extract phase walks the dependency graph in a determined order and issues one or more SOQL queries per object. Large root sets with deep hierarchies generate many round-trips.
 

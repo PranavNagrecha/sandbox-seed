@@ -47,7 +47,7 @@ Restart your host. Then try:
 The model will call the `seed` tool and walk you through the five-step flow (analyze → select → dry-run → confirm → run). No record data ever appears in chat.
 
 **What to expect on first run:**
-- `analyze` on a standard object (Case, Opportunity) against a managed-package-heavy org: **30–90 seconds** cold, ~1–3 seconds warm. The delay is one sequential describe per object in the dependency graph (~20–40 describes for Case). Describes cache at `.sandbox-seeding/cache/` with a 24h TTL.
+- `analyze` on a standard object (Case, Opportunity) against a managed-package-heavy org: **~5–20 seconds** cold, ~1–3 seconds warm. Describes fan out in parallel (6 at a time, with backoff on throttling) across the dependency graph (~20–40 describes for Case), and cache at `.sandbox-seeding/cache/` with a 24h TTL.
 - `extract` rate depends on record count × relationship breadth; small seeds (<500 rows) finish in seconds.
 - Sessions live at `~/.sandbox-seed/sessions/` and are garbage-collected after 7 days. The cross-run project id-map at `~/.sandbox-seed/id-maps/` is persistent.
 

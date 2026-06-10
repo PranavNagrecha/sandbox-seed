@@ -1,6 +1,6 @@
 import type { OrgAuth } from "../auth/sf-auth.ts";
 import { DescribeCache } from "../describe/cache.ts";
-import { DescribeClient } from "../describe/client.ts";
+import { DESCRIBE_CONCURRENCY, DescribeClient } from "../describe/client.ts";
 import { type SObjectDescribe, isReference } from "../describe/types.ts";
 import { SeedError, UserError } from "../errors.ts";
 import {
@@ -14,6 +14,7 @@ import { DEFAULT_FIELD_FILTERS, type FieldFilterOptions } from "../graph/filters
 import { computeLoadOrder, type LoadPlan } from "../graph/order.ts";
 import { isStandardRootObject } from "../graph/standard-objects.ts";
 import { fetchRowCounts } from "../query/counts.ts";
+import { mapWithConcurrency } from "../util/concurrency.ts";
 
 export type InspectOptions = {
   auth: OrgAuth;
@@ -166,6 +167,12 @@ type WalkResult = {
  * childRelationships[]. We fetch each child's describe too so we can classify
  * its required fields, BUT we do NOT walk the child's own parents (that would
  * re-explode the graph).
+ *
+ * Describes within each BFS level (and within the child / child-lookup
+ * phases) fan out in parallel, bounded by DESCRIBE_CONCURRENCY. Levels stay
+ * synchronized so distances remain first-seen (minimum) depth, exactly as
+ * the old one-at-a-time walk computed them. Results are applied in input
+ * order, so graph construction stays deterministic.
  */
 async function walkFromRoot(
   client: DescribeClient,
@@ -187,43 +194,61 @@ async function walkFromRoot(
   describes.set(opts.root, rootDescribe);
   distances.set(opts.root, 0);
 
-  // Parent BFS
-  const parentQueue: Array<{ name: string; depth: number }> = [];
+  // Per-object describe that tolerates permission denials (SeedError →
+  // null, the node stays referenced-only) but fails the walk on anything
+  // else, matching the sequential walk's fail-fast behavior.
+  const tryDescribe = async (name: string): Promise<SObjectDescribe | null> => {
+    try {
+      return await client.describeObject(name);
+    } catch (err) {
+      if (err instanceof SeedError) return null;
+      throw err;
+    }
+  };
+
+  // Parent BFS — level-synchronized, describes within a level in parallel.
+  const enqueued = new Set<string>([opts.root]);
+  let frontier: string[] = [];
   for (const ref of collectReferencedObjects(rootDescribe, opts.filters)) {
     if (ref === opts.root) continue;
-    parentQueue.push({ name: ref, depth: 1 });
+    if (enqueued.has(ref)) continue;
+    enqueued.add(ref);
+    frontier.push(ref);
   }
 
-  while (parentQueue.length > 0) {
-    const { name, depth } = parentQueue.shift()!;
-    if (describes.has(name)) continue;
-    parents.add(name);
-    if (isStandardRootObject(name)) {
-      // Record as a parent but don't describe it (we won't seed it anyway).
-      distances.set(name, depth);
-      continue;
-    }
-
-    let describe: SObjectDescribe;
-    try {
-      describe = await client.describeObject(name);
-    } catch (err) {
-      if (err instanceof SeedError) {
-        // Permission denied on this parent — leave it as referenced-only.
+  let depth = 1;
+  while (frontier.length > 0) {
+    const toDescribe: string[] = [];
+    for (const name of frontier) {
+      if (describes.has(name)) continue;
+      parents.add(name);
+      if (isStandardRootObject(name)) {
+        // Record as a parent but don't describe it (we won't seed it anyway).
         distances.set(name, depth);
         continue;
       }
-      throw err;
+      toDescribe.push(name);
     }
-    describes.set(name, describe);
-    distances.set(name, depth);
 
-    if (depth >= opts.parentDepth) continue;
-    for (const ref of collectReferencedObjects(describe, opts.filters)) {
-      if (describes.has(ref)) continue;
-      if (parentQueue.some((q) => q.name === ref)) continue;
-      parentQueue.push({ name: ref, depth: depth + 1 });
+    const levelDescribes = await mapWithConcurrency(toDescribe, DESCRIBE_CONCURRENCY, tryDescribe);
+
+    const nextFrontier: string[] = [];
+    for (let i = 0; i < toDescribe.length; i++) {
+      const name = toDescribe[i]!;
+      const describe = levelDescribes[i];
+      distances.set(name, depth);
+      if (describe === null || describe === undefined) continue; // referenced-only
+      describes.set(name, describe);
+
+      if (depth >= opts.parentDepth) continue;
+      for (const ref of collectReferencedObjects(describe, opts.filters)) {
+        if (enqueued.has(ref) || describes.has(ref)) continue;
+        enqueued.add(ref);
+        nextFrontier.push(ref);
+      }
     }
+    frontier = nextFrontier;
+    depth++;
   }
 
   // Child walk — exactly one level, from root.
@@ -237,6 +262,7 @@ async function walkFromRoot(
   // other object that referenced Case had already pulled CaseComment into
   // `describes` via the parent walk.
   if (opts.includeChildren) {
+    const toDescribe: string[] = [];
     for (const child of collectChildObjects(rootDescribe)) {
       if (child === opts.root) continue;
       children.add(child);
@@ -250,16 +276,15 @@ async function walkFromRoot(
         if (!distances.has(child)) distances.set(child, 1);
         continue;
       }
-      try {
-        const childDescribe = await client.describeObject(child);
+      toDescribe.push(child);
+    }
+    const childDescribes = await mapWithConcurrency(toDescribe, DESCRIBE_CONCURRENCY, tryDescribe);
+    for (let i = 0; i < toDescribe.length; i++) {
+      const child = toDescribe[i]!;
+      const childDescribe = childDescribes[i];
+      distances.set(child, 1);
+      if (childDescribe !== null && childDescribe !== undefined) {
         describes.set(child, childDescribe);
-        distances.set(child, 1);
-      } catch (err) {
-        if (err instanceof SeedError) {
-          distances.set(child, 1);
-          continue;
-        }
-        throw err;
       }
     }
   }
@@ -271,6 +296,7 @@ async function walkFromRoot(
   // no-op: the target is already in `describes` via the child walk, and
   // buildGraph will emit the self-edge from the child's describe for us.
   if (opts.childLookups !== undefined) {
+    const toDescribe: string[] = [];
     for (const [childName, fieldNames] of Object.entries(opts.childLookups)) {
       const childDescribe = describes.get(childName);
       if (childDescribe === undefined) {
@@ -299,24 +325,22 @@ async function walkFromRoot(
             if (!distances.has(target)) distances.set(target, 2);
             continue;
           }
-          try {
-            const targetDescribe = await client.describeObject(target);
-            describes.set(target, targetDescribe);
-          } catch (err) {
-            if (err instanceof SeedError) {
-              // Permission-denied; leave as referenced-only.
-              parents.add(target);
-              childLookupTargets.add(target);
-              distances.set(target, 2);
-              continue;
-            }
-            throw err;
-          }
-          parents.add(target);
-          childLookupTargets.add(target);
-          distances.set(target, 2);
+          if (!toDescribe.includes(target)) toDescribe.push(target);
         }
       }
+    }
+    const targetDescribes = await mapWithConcurrency(toDescribe, DESCRIBE_CONCURRENCY, tryDescribe);
+    for (let i = 0; i < toDescribe.length; i++) {
+      const target = toDescribe[i]!;
+      const targetDescribe = targetDescribes[i];
+      // Described or permission-denied (referenced-only) — either way the
+      // target joins the seed scope, same as the sequential walk did.
+      if (targetDescribe !== null && targetDescribe !== undefined) {
+        describes.set(target, targetDescribe);
+      }
+      parents.add(target);
+      childLookupTargets.add(target);
+      distances.set(target, 2);
     }
   }
 
