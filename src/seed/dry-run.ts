@@ -233,6 +233,9 @@ export async function runDryRun(opts: DryRunOptions): Promise<DryRunSummary> {
             `${object}: ${missing.length} source-only field(s) will be skipped during run: ${missing.slice(0, 10).join(", ")}${missing.length > 10 ? ", …" : ""}`,
           );
         }
+        schemaIssues.push(
+          ...maskedLengthWarnings(object, srcDesc, tgtDesc, opts.maskedFieldsByObject?.[object]),
+        );
       }
       // Population probe — only needed when the source has 2+ ext-id
       // candidates, since the single-candidate path doesn't need to
@@ -351,6 +354,36 @@ export async function runDryRun(opts: DryRunOptions): Promise<DryRunSummary> {
 }
 
 /**
+ * Warn when a MASKED field is shorter on the target than on the source.
+ * The run clamps mask generation to min(source, target) length (see
+ * intersectWithTargetFields), so nothing breaks — but the user should
+ * know the masked values will be shorter than the source shape suggests.
+ * Names and lengths only; no values.
+ */
+function maskedLengthWarnings(
+  object: string,
+  srcDesc: SObjectDescribe,
+  tgtDesc: SObjectDescribe,
+  maskedFieldNames: string[] | undefined,
+): string[] {
+  if (maskedFieldNames === undefined || maskedFieldNames.length === 0) return [];
+  const srcByName = new Map(srcDesc.fields.map((f) => [f.name, f]));
+  const tgtByName = new Map(tgtDesc.fields.map((f) => [f.name, f]));
+  const out: string[] = [];
+  for (const fname of maskedFieldNames) {
+    const sf = srcByName.get(fname);
+    const tf = tgtByName.get(fname);
+    if (sf === undefined || tf === undefined) continue;
+    if (typeof sf.length === "number" && typeof tf.length === "number" && tf.length < sf.length) {
+      out.push(
+        `${object}.${fname}: masked values will be capped to the target field length ${tf.length} (source is ${sf.length})`,
+      );
+    }
+  }
+  return out;
+}
+
+/**
  * For each object, query the source for rows where any User/Group/Queue
  * reference field is populated. Those references will NOT be remapped at
  * run time (only RecordType is remapped), so the run silently defaults
@@ -401,8 +434,7 @@ async function countDefaultedOwnerRefs(args: {
       let total = 0;
       for (const chunk of chunkIds(scopeIds, ROOT_ID_CHUNK)) {
         const countSoql =
-          `SELECT COUNT() FROM ${object} ` +
-          `WHERE Id IN (${soqlIdList(chunk)}) AND (${filters})`;
+          `SELECT COUNT() FROM ${object} ` + `WHERE Id IN (${soqlIdList(chunk)}) AND (${filters})`;
         total += await countQuery({
           auth: args.sourceAuth,
           soql: countSoql,
@@ -725,6 +757,7 @@ function renderReport(args: {
 export {
   chunkIds as _chunkIds,
   countDefaultedOwnerRefs as _countDefaultedOwnerRefs,
+  maskedLengthWarnings as _maskedLengthWarnings,
   renderReport as _renderReport,
   soqlIdList as _soqlIdList,
 };

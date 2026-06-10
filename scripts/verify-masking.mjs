@@ -138,6 +138,22 @@ for (const object of objects) {
   if (pairs.length === 0) continue;
 
   const fields = await describeFields(source, object);
+  // Mirror the run's length clamping (intersectWithTargetFields): masked
+  // values are capped to min(source, target) field length, so re-derivation
+  // must use the same effective length or a drifted-shorter target field
+  // reports a false mismatch.
+  const targetFields = await describeFields(target, object);
+  for (const [name, f] of fields) {
+    const tf = targetFields.get(name);
+    if (
+      tf &&
+      typeof f.length === "number" &&
+      typeof tf.length === "number" &&
+      tf.length < f.length
+    ) {
+      fields.set(name, { ...f, length: tf.length });
+    }
+  }
   const fieldList = ["Id", ...fieldNames].join(", ");
   const srcIds = pairs.map((p) => `'${p.srcId}'`).join(",");
   const tgtIds = pairs.map((p) => `'${p.tgtId}'`).join(",");
@@ -281,7 +297,9 @@ console.log(
 console.log(`rows missing       ${rowsMissingInTarget}`);
 console.log(`derived == target  ${derivedMatch}   (G3a: mask present)`);
 console.log(`derived != target  ${derivedMismatch}   (unexplained — fails the gate)`);
-console.log(`automation rewrite ${automationRewrites}   (target automation copied another masked field — WARN)`);
+console.log(
+  `automation rewrite ${automationRewrites}   (target automation copied another masked field — WARN)`,
+);
 for (const d of mismatchDiagnostics) console.log(`  ↳ ${d}`);
 console.log(`source leaked      ${leak}   (G3b: must be 0)`);
 console.log(`empties preserved  ${passthroughOk} ok / ${passthroughBad} bad`);

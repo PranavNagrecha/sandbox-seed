@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { intersectWithTargetFields } from "../../src/seed/execute.ts";
 import type { DescribeClient } from "../../src/describe/client.ts";
 import type { Field, SObjectDescribe } from "../../src/describe/types.ts";
+import { intersectWithTargetFields } from "../../src/seed/execute.ts";
 
 /**
  * Schema-drift auto-ignore: when the source has a createable field the
@@ -14,13 +14,14 @@ import type { Field, SObjectDescribe } from "../../src/describe/types.ts";
  * not target during live acceptance testing).
  */
 
-function field(name: string, createable = true): Field {
+function field(name: string, createable = true, length?: number): Field {
   return {
     name,
     type: "string",
     nillable: true,
     custom: false,
     createable,
+    ...(length !== undefined ? { length } : {}),
   } as Field;
 }
 
@@ -70,7 +71,11 @@ describe("execute.intersectWithTargetFields: schema-drift auto-ignore", () => {
   it("keeps everything when source and target schemas agree", async () => {
     const candidates = [field("Name"), field("Industry")];
     const targetDescribe = fakeClient({
-      Account: describeWithFields("Account", [field("Name"), field("Industry"), field("Id", false)]),
+      Account: describeWithFields("Account", [
+        field("Name"),
+        field("Industry"),
+        field("Id", false),
+      ]),
     });
 
     const { kept, dropped } = await intersectWithTargetFields({
@@ -117,5 +122,46 @@ describe("execute.intersectWithTargetFields: schema-drift auto-ignore", () => {
 
     expect(kept).toEqual([]);
     expect(dropped).toEqual(["OnlySrc__c"]);
+  });
+
+  it("clamps a kept field's length to the shorter target length (T14 finding 6)", async () => {
+    // Mask presets cap generated values by Field.length. With the SOURCE
+    // length, a masked value can overflow a drifted-shorter target field
+    // and get truncated on insert — breaking deterministic re-derivation.
+    const candidates = [field("Postal__c", true, 60), field("Name", true, 80)];
+    const targetDescribe = fakeClient({
+      Contact: describeWithFields("Contact", [
+        field("Postal__c", true, 9), // target is SHORTER
+        field("Name", true, 80), // equal — untouched
+      ]),
+    });
+
+    const { kept, dropped, lengthClamped } = await intersectWithTargetFields({
+      object: "Contact",
+      candidates,
+      targetDescribe,
+    });
+
+    expect(dropped).toEqual([]);
+    expect(lengthClamped).toEqual(["Postal__c"]);
+    expect(kept.find((f) => f.name === "Postal__c")?.length).toBe(9);
+    expect(kept.find((f) => f.name === "Name")?.length).toBe(80);
+  });
+
+  it("leaves lengths alone when the target is longer or lengths are absent", async () => {
+    const candidates = [field("Longer__c", true, 10), field("NoLength__c")];
+    const targetDescribe = fakeClient({
+      Contact: describeWithFields("Contact", [field("Longer__c", true, 40), field("NoLength__c")]),
+    });
+
+    const { kept, lengthClamped } = await intersectWithTargetFields({
+      object: "Contact",
+      candidates,
+      targetDescribe,
+    });
+
+    expect(lengthClamped).toEqual([]);
+    expect(kept.find((f) => f.name === "Longer__c")?.length).toBe(10);
+    expect(kept.find((f) => f.name === "NoLength__c")?.length).toBeUndefined();
   });
 });
