@@ -1,6 +1,6 @@
 # ADR 0001 — Deterministic field masking (SF → SF)
 
-**Status:** Accepted — code-complete; production blessing gated on the real-org acceptance smoke (T14).
+**Status:** Accepted — **production-blessed 2026-06-10**: the T14 real-org acceptance gate (a real HEDA-org FULL sandbox → a dev sandbox) passed G1–G6 on three consecutive runs. Evidence + findings: [notes/2026-06-10-t14-masking-acceptance.md](../../notes/2026-06-10-t14-masking-acceptance.md).
 **Date:** 2026-05-31
 **Spec:** [phases/masking-spec.md](../../phases/masking-spec.md) · **Plan:** [phases/masking-plan.md](../../phases/masking-plan.md)
 
@@ -23,5 +23,5 @@ Add opt-in, deterministic, format-preserving field masking on the SF → SF copy
 
 - The boundary's "data on disk is real" caveat now has an opt-in, target-side remedy. AI_BOUNDARY gains a [Masking](../AI_BOUNDARY.md#masking) annex.
 - Deterministic masking is set-membership-confirmable (known-plaintext) — a documented, accepted residual; ephemeral salt (`isolateIdMap`) is the escape hatch.
-- Off by default; opt-in via `mask` / `maskFields`. Final production blessing is gated on the real-org acceptance smoke (T14, `Excelsior FULL → DevCaseInt`).
+- Off by default; opt-in via `mask` / `maskFields`. Final production blessing is gated on the real-org acceptance smoke (T14, `a real HEDA-org FULL sandbox → a dev sandbox`).
 - Reversible / tokenized masking with a vault is explicitly out of scope.
