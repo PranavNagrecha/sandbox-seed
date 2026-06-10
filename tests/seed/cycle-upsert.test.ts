@@ -537,6 +537,99 @@ describe("runExecute — cycle-step UPSERT routing", () => {
     expect(accountBody.records[0].PrimaryContactId).toBeNull();
   });
 
+  it("cycle blank-ext-id rows already in the id-map skip, not re-insert (T14)", async () => {
+    // Found by the T14 real-org gate: blank-upsert-key rows on CYCLE objects
+    // (Account/Contact are almost always cycle steps via self-references)
+    // bypassed the project-id-map dedup and re-inserted on every re-run —
+    // DUPLICATES_DETECTED from the target org's duplicate rules was the
+    // only thing preventing actual dupes.
+    const accountRecords = [
+      {
+        Id: "001SRC000000001AAA",
+        Name: "With Ext Id",
+        ExternalId__c: "ACME-1",
+        PrimaryContactId: null,
+      },
+      {
+        Id: "001SRC000000002AAA",
+        Name: "Blank Already Seeded",
+        ExternalId__c: null,
+        PrimaryContactId: null,
+      },
+      {
+        Id: "001SRC000000003AAA",
+        Name: "Blank New",
+        ExternalId__c: "",
+        PrimaryContactId: null,
+      },
+    ];
+    const { writeFile: wf } = await import("node:fs/promises");
+    await wf(
+      join(tmp, "id-map.json"),
+      JSON.stringify({ "Account:001SRC000000002AAA": "001TGTPRIOR0002AAA" }),
+      "utf8",
+    );
+
+    const calls: Array<{ method: string; url: string; body?: unknown }> = [];
+    const fetchFn = makeFakeFetch({
+      sourceByObject: { Account: accountRecords, Contact: [] },
+      targetResponses: {
+        upsertByObject: {
+          Account: [{ id: "001TGT000000001AAA", success: true, created: true }],
+        },
+        insertByObject: {
+          Account: [{ id: "001TGT000000003AAA", success: true }],
+        },
+      },
+      calls,
+    });
+
+    const desc = fakeDescribeClient({
+      Account: mkAccountDescribe(),
+      Contact: mkContactDescribe(),
+    });
+
+    const result = await runExecute({
+      sourceAuth: mkAuth("src"),
+      targetAuth: mkAuth("tgt"),
+      sourceDescribe: desc,
+      targetDescribe: desc,
+      graph: mkGraph(),
+      rootObject: "Account",
+      whereClause: "Id != null",
+      finalObjectList: ["Account", "Contact"],
+      loadPlan: mkCycleLoadPlan(),
+      sessionDir: tmp,
+      fetchFn,
+      upsertDecisions: {
+        Account: { kind: "picked", field: "ExternalId__c" },
+      },
+    });
+
+    const accountInsertCalls = calls.filter((c) => {
+      if (c.method !== "POST") return false;
+      if (!c.url.endsWith("/composite/sobjects")) return false;
+      const b = c.body as { records?: Array<{ attributes?: { type?: string } }> };
+      return b.records?.[0]?.attributes?.type === "Account";
+    });
+    expect(accountInsertCalls.length).toBe(1);
+    const insertBody = accountInsertCalls[0].body as {
+      records: Array<Record<string, unknown>>;
+    };
+    // Only the genuinely-new blank-key row inserts; the already-seeded one skips.
+    expect(insertBody.records).toHaveLength(1);
+    expect(insertBody.records[0].Name).toBe("Blank New");
+
+    expect(result.errorCount).toBe(0);
+    expect(result.alreadySeededCounts?.Account).toBe(1);
+    const idMapJson = JSON.parse(await readFile(join(tmp, "id-map.json"), "utf8")) as Record<
+      string,
+      string
+    >;
+    expect(idMapJson["Account:001SRC000000002AAA"]).toBe("001TGTPRIOR0002AAA");
+    expect(idMapJson["Account:001SRC000000003AAA"]).toBe("001TGT000000003AAA");
+  });
+
   it("splits a cycle batch: populated ext-id → UPSERT, blank → INSERT", async () => {
     const accountRecords = [
       {
