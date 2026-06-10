@@ -321,6 +321,9 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteSummary> 
         for (const [o, n] of Object.entries(res.inserted)) {
           insertedCounts[o] = (insertedCounts[o] ?? 0) + n;
         }
+        for (const [o, n] of Object.entries(res.alreadySeeded)) {
+          alreadySeededCounts[o] = (alreadySeededCounts[o] ?? 0) + n;
+        }
         errorCount += res.errors;
       }
       await idMap.save();
@@ -539,6 +542,16 @@ async function seedSingle(args: {
           upsertRewrites.push({ body: rewritten, sourceId });
           continue;
         }
+        // Blank upsert key → this row can't UPSERT-match, so it takes the
+        // INSERT path — which must consult the project id-map exactly like
+        // the no-key path above, or re-runs re-insert it. Found by the T14
+        // gate: blank-external-id Contacts duplicated on the second run
+        // (only the org's duplicate rules stopped them).
+        if (sourceId.length > 0 && idMap.has(object, sourceId)) {
+          alreadySeeded++;
+          alreadySeededInChunk++;
+          continue;
+        }
       }
       insertRewrites.push({ body: rewritten, sourceId });
     }
@@ -659,7 +672,11 @@ async function seedCycle(args: {
   appendLog: (msg: string) => Promise<void>;
   projectMapLoadedByTargetId: Map<string, { object: string; sourceId: string }>;
   masker: Masker | undefined;
-}): Promise<{ inserted: Record<string, number>; errors: number }> {
+}): Promise<{
+  inserted: Record<string, number>;
+  errors: number;
+  alreadySeeded: Record<string, number>;
+}> {
   const {
     step,
     opts,
@@ -674,10 +691,11 @@ async function seedCycle(args: {
 
   if (step.breakEdge === null) {
     await appendLog(`SKIP cycle ${step.objects.join(",")}: no nillable break edge available.`);
-    return { inserted: {}, errors: 0 };
+    return { inserted: {}, errors: 0, alreadySeeded: {} };
   }
 
   const inserted: Record<string, number> = {};
+  const alreadySeeded: Record<string, number> = {};
   let errors = 0;
 
   // Phase 1: insert every object with the break-edge field nulled.
@@ -787,6 +805,7 @@ async function seedCycle(args: {
     }
 
     let objectInserted = 0;
+    let objectAlreadySeeded = 0;
     for (const chunk of chunkIds(records, BATCH_SIZE)) {
       const upsertRewrites: Array<{ body: Record<string, unknown>; sourceId: string }> = [];
       const insertRewrites: Array<{ body: Record<string, unknown>; sourceId: string }> = [];
@@ -805,6 +824,17 @@ async function seedCycle(args: {
           if (v !== null && v !== undefined && v !== "") {
             routeToUpsert = true;
           }
+        }
+
+        // Cross-run dedup, mirroring seedSingle: an INSERT-path row the
+        // id-map already maps (project map from a prior run) must not
+        // re-insert. UPSERT-routed rows still go through — match-and-update
+        // is what an external-id key asks for. Found by the T14 gate:
+        // blank-key cycle rows re-inserted on every re-run, with only the
+        // target org's duplicate rules standing between them and dupes.
+        if (!routeToUpsert && sourceId.length > 0 && idMap.has(object, sourceId)) {
+          objectAlreadySeeded++;
+          continue;
         }
 
         // Break-edge handling in phase 1:
@@ -909,6 +939,12 @@ async function seedCycle(args: {
       }
     }
     inserted[object] = (inserted[object] ?? 0) + objectInserted;
+    if (objectAlreadySeeded > 0) {
+      alreadySeeded[object] = (alreadySeeded[object] ?? 0) + objectAlreadySeeded;
+      await appendLog(
+        `${object} [cycle]: skipped ${objectAlreadySeeded} record(s) already present in project id-map (cross-run dedup).`,
+      );
+    }
   }
 
   // Phase 2: for each source record of `breakSource` with a non-null break-edge
@@ -981,7 +1017,7 @@ async function seedCycle(args: {
     }
   }
 
-  return { inserted, errors };
+  return { inserted, errors, alreadySeeded };
 }
 
 // ────────────────────────────────────────────────────────────────────

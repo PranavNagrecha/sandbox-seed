@@ -424,6 +424,72 @@ describe("runExecute — UPSERT routing", () => {
     expect(idMapJson["Contact:003SRC000000003AAA"]).toBe("003TGT000000003AAA");
   });
 
+  it("blank-ext-id rows already in the id-map are skipped, not re-inserted (T14)", async () => {
+    // Found by the T14 real-org gate: on an object WITH a picked upsert key,
+    // rows whose key value is blank fall back to INSERT — and used to bypass
+    // the id-map dedup that the no-key path applies. On a re-run they were
+    // re-inserted; only the target org's duplicate rules stopped actual
+    // dupes (DUPLICATES_DETECTED). The INSERT fallback must consult the
+    // id-map exactly like the no-key path.
+    const sourceRecords = [
+      { Id: "003SRC000000001AAA", LastName: "Alice", SSN__c: "111-11-1111" }, // upserts
+      { Id: "003SRC000000002AAA", LastName: "Bob", SSN__c: null }, // blank key, ALREADY SEEDED
+      { Id: "003SRC000000003AAA", LastName: "Carol", SSN__c: "" }, // blank key, new
+    ];
+    const { writeFile: wf } = await import("node:fs/promises");
+    await wf(
+      join(tmp, "id-map.json"),
+      JSON.stringify({ "Contact:003SRC000000002AAA": "003TGTPRIOR0002AAA" }),
+      "utf8",
+    );
+
+    const calls: Array<{ method: string; url: string; body?: unknown }> = [];
+    const fetchFn = makeFakeFetch({
+      sourceRecords,
+      targetResponses: {
+        upsert: [{ id: "003TGT000000001AAA", success: true, created: true }],
+        insert: [{ id: "003TGT000000003AAA", success: true }],
+      },
+      calls,
+    });
+
+    const desc = fakeDescribeClient({ Contact: mkContactDescribe() });
+
+    const result = await runExecute({
+      sourceAuth: mkAuth("src"),
+      targetAuth: mkAuth("tgt"),
+      sourceDescribe: desc,
+      targetDescribe: desc,
+      graph: mkGraph(),
+      rootObject: "Contact",
+      whereClause: "Id != null",
+      finalObjectList: ["Contact"],
+      loadPlan: mkLoadPlan(),
+      sessionDir: tmp,
+      fetchFn,
+      upsertDecisions: {
+        Contact: { kind: "picked", field: "SSN__c" },
+      },
+    });
+
+    // Bob (already seeded) must NOT appear in any insert body.
+    const insertCalls = calls.filter(
+      (c) => c.method === "POST" && c.url.endsWith("/composite/sobjects"),
+    );
+    expect(insertCalls.length).toBe(1);
+    const insertBody = insertCalls[0].body as { records: Array<Record<string, unknown>> };
+    expect(insertBody.records).toHaveLength(1);
+    expect(insertBody.records[0].LastName).toBe("Carol");
+
+    // No errors; Bob's prior mapping is preserved untouched.
+    expect(result.errorCount).toBe(0);
+    const idMapJson = JSON.parse(
+      await readFile(join(tmp, "id-map.json"), "utf8"),
+    ) as Record<string, string>;
+    expect(idMapJson["Contact:003SRC000000002AAA"]).toBe("003TGTPRIOR0002AAA");
+    expect(idMapJson["Contact:003SRC000000003AAA"]).toBe("003TGT000000003AAA");
+  });
+
   it("uses INSERT for every record when no upsert decision is picked (pre-upsert behavior)", async () => {
     const sourceRecords = [
       { Id: "003SRC000000001AAA", LastName: "Alice", SSN__c: "111-11-1111" },
