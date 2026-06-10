@@ -286,6 +286,7 @@ const MASK_STRATEGIES = new Set([
   "phone",
   "person-name",
   "street-address",
+  "postal-code",
   "generic-text",
   "auto",
   "copy",

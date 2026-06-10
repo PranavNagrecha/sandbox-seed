@@ -6,6 +6,7 @@ import {
   genericTextPreset,
   personNamePreset,
   phonePreset,
+  postalCodePreset,
   streetAddressPreset,
 } from "../../../src/seed/mask/presets.ts";
 
@@ -38,6 +39,21 @@ describe("mask presets — format & length preservation (invariant #3)", () => {
     const a = streetAddressPreset(7, field("Street", "textarea", { length: 30 }));
     expect(a.length).toBeGreaterThan(0);
     expect(a.length).toBeLessThanOrEqual(30);
+  });
+
+  it("postal code is 5 digits and fits short postal fields", () => {
+    // Street addresses overflowed 9-char postal fields and truncated on
+    // insert — found by the T14 real-org gate on Postal_Code__c.
+    const z = postalCodePreset(7, field("Postal_Code__c", "string", { length: 9 }));
+    expect(z).toMatch(/^\d{5}$/);
+    expect(
+      postalCodePreset(7, field("Zip__c", "string", { length: 3 })).length,
+    ).toBeLessThanOrEqual(3);
+  });
+
+  it("postal code is deterministic for a given seed", () => {
+    expect(postalCodePreset(99, field("Zip__c"))).toBe(postalCodePreset(99, field("Zip__c")));
+    expect(postalCodePreset(99, field("Zip__c"))).not.toBe(postalCodePreset(100, field("Zip__c")));
   });
 
   it("generic text respects a tiny length", () => {

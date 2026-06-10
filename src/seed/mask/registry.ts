@@ -6,6 +6,7 @@ import {
   genericTextPreset,
   personNamePreset,
   phonePreset,
+  postalCodePreset,
   streetAddressPreset,
 } from "./presets.ts";
 import {
@@ -35,7 +36,12 @@ export function pickStrategy(field: Field): ConcreteStrategy {
   // Order matters: email and phone are more specific than the broad name match.
   if (t === "email" || /email/.test(n)) return "email";
   if (t === "phone" || /phone|mobile|fax/.test(n)) return "phone";
-  if (/street|address|mailing|billing|shipping|postal|\bzip\b/.test(n)) return "street-address";
+  // Postal/zip BEFORE the broader address match: postal fields are short and
+  // digit-shaped; a street address overflows + truncates on insert (T14).
+  // Bare "zip" (no \b): underscores are word chars, so \bzip\b misses
+  // Office_Zip_Code__c-style names.
+  if (/postal|zip/.test(n)) return "postal-code";
+  if (/street|address|mailing|billing|shipping/.test(n)) return "street-address";
   if (/name|patient/.test(n)) return "person-name";
   return "generic-text";
 }
@@ -86,6 +92,8 @@ export function createMasker(opts: { salt: string; selection: MaskSelection }): 
             return personNamePreset(seed, field);
           case "street-address":
             return streetAddressPreset(seed, field);
+          case "postal-code":
+            return postalCodePreset(seed, field);
           case "generic-text":
             return genericTextPreset(seed, field);
           default:

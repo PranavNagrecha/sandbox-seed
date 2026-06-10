@@ -45,6 +45,14 @@ export function streetAddressPreset(seed: number, field: Field): string {
   return capLen(faker.location.streetAddress(), field);
 }
 
+export function postalCodePreset(seed: number, field: Field): string {
+  faker.seed(seed);
+  // 5-digit US-style zip: postal fields are often short (5–10 chars) and
+  // validated as digit-only; a street address here overflows and truncates
+  // on insert (found by the T14 real-org gate on Postal_Code__c).
+  return capLen(faker.string.numeric({ length: 5, allowLeadingZeros: false }), field);
+}
+
 export function genericTextPreset(seed: number, field: Field): string {
   faker.seed(seed);
   return capLen(faker.lorem.words(2), field);
