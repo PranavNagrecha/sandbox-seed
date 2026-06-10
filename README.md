@@ -155,8 +155,12 @@ Then for each subsequent step, paste back the JSON the agent suggests:
 
 ---
 
-## What's shipped in 0.2.0
+## What's shipped in 0.2.x
 
+- **First-class CLI `seed` command** (new in 0.2.8) — `sandbox-seed seed` / `seed resume` / `seed recover` drive the same engine and safety gates as the MCP tool from a terminal or CI (`--dry-run-only`, `--yes`, `--json`).
+- **Parallel describe walk** (new in 0.2.8) — cold-cache `analyze`/`inspect` fan describes out 6 at a time; full-graph analyze on managed-package-heavy orgs dropped from 30–90s to ~5–20s.
+- **Masking production-blessed** (0.2.8) — the real-org acceptance gate passed G1–G6 on three consecutive runs; adds a digit-shaped `postal-code` preset, masked values cap to the shorter of source/target field length, and the dry-run report warns when a masked field is shorter on the target.
+- **Sticky upsert keys** (new in 0.2.8) — the external-id each object UPSERTs on persists per (source, target) pair and is reused (re-validated) by later sessions, so re-seeds keep matching the rows earlier runs created.
 - **MCP `seed` tool** — five-step SF → SF copy flow (analyze → select → dry-run → confirm → run) with cross-org FK remapping, two-phase cycle inserts, validation-rule snapshot/restore, and the AI-boundary contract.
 - **Child + 1 user-selected lookups** (new in 0.2.0) — at `start`, name specific reference fields on direct children of the root; the walker follows each exactly one hop to pull that target object into scope. Multi-path objects (reachable via direct FK *and* child-lookup) union their ID sets rather than picking one path.
 - **Semi-joins in `whereClause` now supported** (fixed in 0.2.0) — root predicates like `Id IN (SELECT … FROM …)` work end-to-end. Root IDs are materialized once and spliced into downstream scopes as literal `Id IN ('…','…')`, sidestepping SOQL's one-level semi-join limit.
@@ -166,7 +170,7 @@ Then for each subsequent step, paste back the JSON the agent suggests:
 
 Not yet shipped: synthetic data generation, CSV import, multi-target fan-out. These are roadmap.
 
-### Scope & limitations to know about in 0.2.0
+### Scope & limitations to know about in 0.2.x
 
 - **One session = one id-map.** The source→target ID map is session-scoped (written to the session dir). Seeds cannot yet be **composed across runs** — if you seed Accounts in one session and then seed Applications in a second session, the second session does not recognize the Accounts from the first. Required lookups are skipped; nillable lookups are inserted as `null`. Workaround: seed everything you need in a single session by rooting the seed on the highest shared object (e.g. Account), so the id-map is populated in dependency order within one run. A project-level id-map that composes across runs is on the roadmap.
 - **Child-lookup walking is one hop only, user-selected.** 0.2.0 walks user-named reference fields on direct children exactly one hop further. No transitive expansion, no auto-discovery. If you need a two-hop chain (child → parent → grandparent), root the seed on the child instead so its parents are walked transitively.
@@ -186,7 +190,7 @@ More: [docs/AUTH.md](docs/AUTH.md).
 
 ## Status
 
-Pre-release (`0.2.0`). APIs and flags may change before `1.0`. Use in sandboxes only — **never** point this at a production org as the target (the tool refuses, but don't test the refusal with real money).
+Pre-release (`0.2.8`). APIs and flags may change before `1.0`. Use in sandboxes only — **never** point this at a production org as the target (the tool refuses, but don't test the refusal with real money).
 
 Roadmap: [BACKLOG in project notes, soon to be moved into GitHub Issues].
 
