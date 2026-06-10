@@ -27,6 +27,8 @@ describe("pickStrategy", () => {
     expect(pickStrategy(field("MobilePhone__c", "string"))).toBe("phone");
     expect(pickStrategy(field("PersonEmail", "string"))).toBe("email");
     expect(pickStrategy(field("MailingStreet", "textarea"))).toBe("street-address");
+    expect(pickStrategy(field("MailingPostalCode", "string"))).toBe("postal-code");
+    expect(pickStrategy(field("Office_Zip_Code__c", "string"))).toBe("postal-code");
     expect(pickStrategy(field("FirstName", "string"))).toBe("person-name");
     expect(pickStrategy(field("Description", "textarea"))).toBe("generic-text");
   });

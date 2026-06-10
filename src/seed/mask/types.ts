@@ -42,6 +42,7 @@ export type MaskStrategy =
   | "phone"
   | "person-name"
   | "street-address"
+  | "postal-code"
   | "generic-text"
   | "auto";
 

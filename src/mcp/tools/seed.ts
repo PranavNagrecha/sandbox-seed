@@ -204,6 +204,7 @@ export const SeedArgs = z.object({
                 "phone",
                 "person-name",
                 "street-address",
+                "postal-code",
                 "generic-text",
                 "auto",
                 "copy",
