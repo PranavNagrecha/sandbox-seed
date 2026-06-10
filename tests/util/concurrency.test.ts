@@ -16,12 +16,16 @@ describe("mapWithConcurrency", () => {
   it("never exceeds the concurrency limit", async () => {
     let inFlight = 0;
     let maxInFlight = 0;
-    await mapWithConcurrency(Array.from({ length: 20 }, (_, i) => i), 3, async () => {
-      inFlight++;
-      maxInFlight = Math.max(maxInFlight, inFlight);
-      await sleep(5);
-      inFlight--;
-    });
+    await mapWithConcurrency(
+      Array.from({ length: 20 }, (_, i) => i),
+      3,
+      async () => {
+        inFlight++;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await sleep(5);
+        inFlight--;
+      },
+    );
     expect(maxInFlight).toBe(3);
   });
 
@@ -40,12 +44,16 @@ describe("mapWithConcurrency", () => {
   it("propagates the first error and stops claiming new items", async () => {
     const started: number[] = [];
     await expect(
-      mapWithConcurrency(Array.from({ length: 10 }, (_, i) => i), 2, async (i) => {
-        started.push(i);
-        await sleep(5);
-        if (i === 1) throw new Error("boom");
-        return i;
-      }),
+      mapWithConcurrency(
+        Array.from({ length: 10 }, (_, i) => i),
+        2,
+        async (i) => {
+          started.push(i);
+          await sleep(5);
+          if (i === 1) throw new Error("boom");
+          return i;
+        },
+      ),
     ).rejects.toThrow("boom");
     // Workers stop claiming after the failure: with limit 2 and the error on
     // item 1, far fewer than all 10 items should ever have started.
