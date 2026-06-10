@@ -22,6 +22,8 @@ For the overall scope of the 0.2.x line and the AI-boundary contract, see the [R
 
 **The project id-map is trusted, not verified.** If a target row is deleted out-of-band (manual cleanup, another data loader, a sandbox refresh the tool didn't observe), the map still points at the dead target id and the next run's insert fails with `INVALID_CROSS_REFERENCE_KEY`. `execute.log` flags the specific stale entries and suggests recovery via `isolateIdMap: true`. See [AI_BOUNDARY.md](AI_BOUNDARY.md#what-this-is-not).
 
+**Picked upsert keys persist per (source, target) pair.** The external-id each object UPSERTs on is stored at `~/.sandbox-seed/id-maps/<sourceAlias>__<targetAlias>.upsert-keys.json` after a run and reused by later sessions (re-validated against both schemas each time), so re-seeds keep matching on the same key even when scope changes would auto-pick differently. An explicit `upsertKeyOverrides` always wins and updates the stored pick; `isolateIdMap: true` ignores the store; delete the file to force a fresh auto-pick.
+
 **One session = one id-map for that session's records.** Within a session, the per-session id-map is populated in dependency order; across sessions, the project map stitches FKs back together. If you seed Accounts in session A and Contacts (which reference those Accounts) in session B, the project map resolves the FK. The only composition limit is when `isolateIdMap: true` is set.
 
 ---

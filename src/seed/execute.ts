@@ -23,6 +23,7 @@ import { createMasker } from "./mask/registry.ts";
 import { type MaskSelection, type Masker, OMIT_ROW } from "./mask/types.ts";
 import { ProjectIdMap, type TargetIdentity } from "./project-id-map.ts";
 import type { ExecuteSummary, UpsertDecisionSummary } from "./session.ts";
+import { saveUpsertKeys } from "./upsert-key-store.ts";
 import { reactivateFromSnapshot, snapshotAndDeactivate } from "./validation-rule-toggle.ts";
 
 /**
@@ -378,6 +379,29 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteSummary> 
         `[${new Date().toISOString()}] Project id-map merge-back failed: ${msg}. Session id-map.json still has the authoritative entries.\n`,
         "utf8",
       );
+    }
+
+    // Persist this run's picked upsert keys beside the project map so the
+    // NEXT session re-uses the same external-id per object (sticky pick;
+    // re-validated at dry-run). Same best-effort stance as the merge-back.
+    const pickedKeys: Record<string, string> = {};
+    for (const [object, d] of Object.entries(opts.upsertDecisions ?? {})) {
+      if (d.kind === "picked") pickedKeys[object] = d.field;
+    }
+    if (Object.keys(pickedKeys).length > 0) {
+      const targetAlias = opts.targetAliasForIdMap ?? opts.targetOrgAlias;
+      if (typeof opts.sourceAlias === "string" && typeof targetAlias === "string") {
+        try {
+          await saveUpsertKeys({ sourceAlias: opts.sourceAlias, targetAlias }, pickedKeys);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          await appendFile(
+            logPath,
+            `[${new Date().toISOString()}] Upsert-key store write failed: ${msg}. Next session re-runs auto-pick.\n`,
+            "utf8",
+          );
+        }
+      }
     }
   }
 
