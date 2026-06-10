@@ -235,6 +235,45 @@ describe("runExecute — field masking wiring (T6/T7)", () => {
     expect(alice?.AccountId).toBeNull();
   });
 
+  it("masked values cap to the TARGET field length when it is shorter (T14 finding 6)", async () => {
+    // Schema drift between same-lineage sandboxes: target Email is 12 chars,
+    // source is 80. With the source length the masked email would overflow
+    // and Salesforce would truncate it on insert, breaking deterministic
+    // re-derivation. intersectWithTargetFields clamps Field.length to
+    // min(source, target) before the masker sees it.
+    const sessionDir = await mkdtemp(join(tmpdir(), "mask-wire-"));
+    dirs.push(sessionDir);
+    const calls: Array<{ method: string; url: string; body?: unknown }> = [];
+    const sourceDesc = fakeDescribeClient({ Contact: mkContactDescribe() });
+    const shortEmailContact = mkContactDescribe();
+    shortEmailContact.fields = shortEmailContact.fields.map((f) =>
+      f.name === "Email" ? { ...f, length: 12 } : f,
+    );
+    const targetDesc = fakeDescribeClient({ Contact: shortEmailContact });
+
+    await runExecute({
+      sourceAuth: mkAuth("src"),
+      targetAuth: mkAuth("tgt"),
+      sourceDescribe: sourceDesc,
+      targetDescribe: targetDesc,
+      graph: mkGraph(),
+      rootObject: "Contact",
+      whereClause: "Id != null",
+      finalObjectList: ["Contact"],
+      loadPlan: mkLoadPlan(),
+      sessionDir,
+      fetchFn: makeFakeFetch(calls),
+      masking: { salt: "stable", selection: emailOnly },
+    });
+
+    const alice = insertedRecords(calls).find((x) => x.LastName === "Alice");
+    expect(typeof alice?.Email).toBe("string");
+    // Capped to the TARGET length, never the longer source length.
+    expect((alice?.Email as string).length).toBeLessThanOrEqual(12);
+    // Still masked, never the original.
+    expect(alice?.Email).not.toBe(ORIGINAL_ALICE);
+  });
+
   it("idempotent: two runs with the same salt produce identical masked values (invariant #7)", async () => {
     const a = await runFresh({ salt: "stable", selection: emailOnly });
     const b = await runFresh({ salt: "stable", selection: emailOnly });

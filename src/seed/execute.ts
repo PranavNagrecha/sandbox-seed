@@ -4,7 +4,7 @@ import type { OrgAuth } from "../auth/sf-auth.ts";
 import type { DescribeClient } from "../describe/client.ts";
 import type { Field, SObjectDescribe } from "../describe/types.ts";
 import { isReference } from "../describe/types.ts";
-import { ApiError, salesforceErrorSummary, UserError } from "../errors.ts";
+import { ApiError, UserError, salesforceErrorSummary } from "../errors.ts";
 import type { DependencyGraph } from "../graph/build.ts";
 import type { LoadPlan, LoadStep } from "../graph/order.ts";
 import { isStandardRootObject } from "../graph/standard-objects.ts";
@@ -428,7 +428,11 @@ async function seedSingle(args: {
   // Drop source-only fields that the target org is missing. User explicitly
   // asked: "when this happens we need to ignore these fields". The dry-run
   // report already surfaced these names for the user to review.
-  const { kept: createable, dropped } = await intersectWithTargetFields({
+  const {
+    kept: createable,
+    dropped,
+    lengthClamped,
+  } = await intersectWithTargetFields({
     object,
     candidates: allCreateable,
     targetDescribe: opts.targetDescribe,
@@ -436,6 +440,11 @@ async function seedSingle(args: {
   if (dropped.length > 0) {
     await appendLog(
       `${object}: skipping ${dropped.length} source-only field(s) not present on target: ${dropped.slice(0, 20).join(", ")}${dropped.length > 20 ? ", …" : ""}`,
+    );
+  }
+  if (lengthClamped.length > 0) {
+    await appendLog(
+      `${object}: clamped ${lengthClamped.length} field length(s) to the shorter target field (masked values cap accordingly): ${lengthClamped.join(", ")}`,
     );
   }
   if (createable.length === 0) {
@@ -716,7 +725,11 @@ async function seedCycle(args: {
     }
     const srcDescribe = await opts.sourceDescribe.describeObject(object);
     const allCreateable = pickCreateableFields(srcDescribe);
-    const { kept: createable, dropped } = await intersectWithTargetFields({
+    const {
+      kept: createable,
+      dropped,
+      lengthClamped,
+    } = await intersectWithTargetFields({
       object,
       candidates: allCreateable,
       targetDescribe: opts.targetDescribe,
@@ -724,6 +737,11 @@ async function seedCycle(args: {
     if (dropped.length > 0) {
       await appendLog(
         `${object} [cycle]: skipping ${dropped.length} source-only field(s) not present on target: ${dropped.slice(0, 20).join(", ")}${dropped.length > 20 ? ", …" : ""}`,
+      );
+    }
+    if (lengthClamped.length > 0) {
+      await appendLog(
+        `${object} [cycle]: clamped ${lengthClamped.length} field length(s) to the shorter target field (masked values cap accordingly): ${lengthClamped.join(", ")}`,
       );
     }
     const byId = new Map<string, Record<string, unknown>>();
@@ -1205,21 +1223,36 @@ export async function intersectWithTargetFields(args: {
   object: string;
   candidates: Field[];
   targetDescribe: DescribeClient;
-}): Promise<{ kept: Field[]; dropped: string[] }> {
-  let targetFieldNames: Set<string>;
+}): Promise<{ kept: Field[]; dropped: string[]; lengthClamped: string[] }> {
+  let targetByName: Map<string, Field>;
   try {
     const td = await args.targetDescribe.describeObject(args.object);
-    targetFieldNames = new Set(td.fields.map((f) => f.name));
+    targetByName = new Map(td.fields.map((f) => [f.name, f]));
   } catch {
-    return { kept: args.candidates, dropped: [] };
+    return { kept: args.candidates, dropped: [], lengthClamped: [] };
   }
   const kept: Field[] = [];
   const dropped: string[] = [];
+  const lengthClamped: string[] = [];
   for (const f of args.candidates) {
-    if (targetFieldNames.has(f.name)) kept.push(f);
-    else dropped.push(f.name);
+    const tf = targetByName.get(f.name);
+    if (tf === undefined) {
+      dropped.push(f.name);
+      continue;
+    }
+    // Clamp the field's length to the SHORTER of source/target. Mask
+    // presets cap generated values by Field.length; with the source
+    // length a masked value can exceed a drifted-shorter target field
+    // and get truncated on insert, breaking deterministic re-derivation
+    // (T14 finding 6). min(source, target) is what actually fits.
+    if (typeof f.length === "number" && typeof tf.length === "number" && tf.length < f.length) {
+      kept.push({ ...f, length: tf.length });
+      lengthClamped.push(f.name);
+      continue;
+    }
+    kept.push(f);
   }
-  return { kept, dropped };
+  return { kept, dropped, lengthClamped };
 }
 
 /**
@@ -1289,9 +1322,7 @@ function composeScopeSoqls(args: {
       if (args.sampleApplied === true && args.rootIds.length > 0) {
         const out: string[] = [];
         for (const chunk of chunkIds(args.rootIds, ROOT_ID_CHUNK)) {
-          out.push(
-            `SELECT ${fieldList} FROM ${args.object} WHERE Id IN (${soqlIdList(chunk)})`,
-          );
+          out.push(`SELECT ${fieldList} FROM ${args.object} WHERE Id IN (${soqlIdList(chunk)})`);
         }
         return out;
       }
