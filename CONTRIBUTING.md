@@ -137,7 +137,7 @@ npm version patch     # or minor / major
 git push --follow-tags
 
 # 2. Create a GitHub Release
-gh release create v0.2.7 --generate-notes
+gh release create v0.X.Y --generate-notes   # match the version npm version just created
 
 # 3. Watch the Actions tab; workflow publishes to npm automatically
 ```
