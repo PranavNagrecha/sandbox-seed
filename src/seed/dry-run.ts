@@ -279,7 +279,7 @@ export async function runDryRun(opts: DryRunOptions): Promise<DryRunSummary> {
     objects: opts.finalObjectList,
     sourceAuth: opts.sourceAuth,
     sourceDescribe: opts.sourceDescribe,
-    perObjectSoql,
+    materializedIds,
     fetchFn: opts.fetchFn,
   });
   const totalDefaultedOwnerRefs = Object.values(defaultedByObject).reduce((a, b) => a + b, 0);
@@ -365,7 +365,8 @@ async function countDefaultedOwnerRefs(args: {
   objects: string[];
   sourceAuth: OrgAuth;
   sourceDescribe: DescribeClient;
-  perObjectSoql: Record<string, string>;
+  /** The exact in-scope IDs per object, as materialized by the dry-run. */
+  materializedIds: Map<string, string[]>;
   fetchFn?: typeof fetch;
 }): Promise<Record<string, number>> {
   const out: Record<string, number> = {};
@@ -387,27 +388,28 @@ async function countDefaultedOwnerRefs(args: {
     }
     if (ownerFields.length === 0) continue;
 
-    // Reuse the first per-object scope SOQL line to pin the same WHERE as
-    // dry-run's count, then add the owner-FK populated filter. Skip the
-    // object if the stored SOQL is a comment (transitive/unknown path) or
-    // doesn't have a WHERE to extend.
-    const scopeSoql = args.perObjectSoql[object];
-    if (scopeSoql === undefined || scopeSoql.length === 0) continue;
-    const firstPath = scopeSoql.split("\n\n")[0] ?? "";
-    const soqlLine = firstPath.split("\n").find((l) => l.toUpperCase().startsWith("SELECT"));
-    if (soqlLine === undefined) continue;
-    const whereIx = soqlLine.toUpperCase().indexOf(" WHERE ");
-    if (whereIx === -1) continue;
-    const whereBody = soqlLine.slice(whereIx + 7);
+    // Count over the EXACT in-scope IDs the dry-run materialized — not a
+    // re-derivation from the WHERE clause. The clause over-counts whenever
+    // the session was sampled (sampleSize takes the first N of the match)
+    // and under-counts multi-chunk child scopes; the ID set is what the
+    // run will actually process. Chunked to stay URL-safe, COUNT()-only —
+    // no record data leaves the source org.
+    const scopeIds = args.materializedIds.get(object);
+    if (scopeIds === undefined || scopeIds.length === 0) continue;
     const filters = ownerFields.map((f) => `${f.name} != null`).join(" OR ");
-    const countSoql = `SELECT COUNT() FROM ${object} WHERE (${whereBody}) AND (${filters})`;
     try {
-      const n = await countQuery({
-        auth: args.sourceAuth,
-        soql: countSoql,
-        fetchFn: args.fetchFn,
-      });
-      if (n > 0) out[object] = n;
+      let total = 0;
+      for (const chunk of chunkIds(scopeIds, ROOT_ID_CHUNK)) {
+        const countSoql =
+          `SELECT COUNT() FROM ${object} ` +
+          `WHERE Id IN (${soqlIdList(chunk)}) AND (${filters})`;
+        total += await countQuery({
+          auth: args.sourceAuth,
+          soql: countSoql,
+          fetchFn: args.fetchFn,
+        });
+      }
+      if (total > 0) out[object] = total;
     } catch {
       // Best-effort preview — never fails the dry-run.
     }
@@ -720,4 +722,9 @@ function renderReport(args: {
 
 // Referenced but not used — kept for symmetry with execute.ts. If a caller
 // wants to sanity-check the chunking math, they can import this.
-export { chunkIds as _chunkIds, renderReport as _renderReport, soqlIdList as _soqlIdList };
+export {
+  chunkIds as _chunkIds,
+  countDefaultedOwnerRefs as _countDefaultedOwnerRefs,
+  renderReport as _renderReport,
+  soqlIdList as _soqlIdList,
+};
