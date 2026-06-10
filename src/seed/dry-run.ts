@@ -19,6 +19,7 @@ import {
 import { buildCanonicalPlan, canonicalStringify, hashCanonicalPlan } from "./plan-hash.ts";
 import { ProjectIdMap, type TargetIdentity } from "./project-id-map.ts";
 import type { DryRunSummary, UpsertDecisionSummary } from "./session.ts";
+import { loadUpsertKeys } from "./upsert-key-store.ts";
 import { discoverCandidates, queryFieldPopulation, resolveUpsertKey } from "./upsert-key.ts";
 
 const DEFAULTED_OWNER_TARGETS = new Set(["User", "Group", "Queue"]);
@@ -201,6 +202,24 @@ export async function runDryRun(opts: DryRunOptions): Promise<DryRunSummary> {
     }
   }
 
+  // Sticky upsert keys from prior runs against this (source, target)
+  // pair. Loaded once; resolveUpsertKey re-validates each entry against
+  // the live describes (override > sticky > auto-pick). Skipped under
+  // isolateIdMap — same clean-slate semantics as the project id-map.
+  let stickyUpsertKeys: Record<string, string> = {};
+  if (
+    opts.isolateIdMap !== true &&
+    typeof opts.sourceAlias === "string" &&
+    opts.sourceAlias.length > 0 &&
+    typeof opts.targetAliasForIdMap === "string" &&
+    opts.targetAliasForIdMap.length > 0
+  ) {
+    stickyUpsertKeys = await loadUpsertKeys({
+      sourceAlias: opts.sourceAlias,
+      targetAlias: opts.targetAliasForIdMap,
+    });
+  }
+
   // Schema diff against target. Flag any missing object or createable
   // field that the source has but the target lacks. In the same pass,
   // compute the INSERT-vs-UPSERT decision — it needs the same pair of
@@ -265,6 +284,7 @@ export async function runDryRun(opts: DryRunOptions): Promise<DryRunSummary> {
       upsertDecisions[object] = resolveUpsertKey(srcDesc, tgtDesc, {
         populationByField,
         override,
+        sticky: stickyUpsertKeys[object],
       });
     } catch (err) {
       schemaIssues.push(

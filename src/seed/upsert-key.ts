@@ -118,6 +118,14 @@ export type ResolveUpsertKeyOptions = {
    * caller can surface the mistake instead of silently falling back.
    */
   override?: string;
+  /**
+   * The key a PRIOR run against this (source, target) pair used, loaded
+   * from the upsert-key store. Beats auto-pick but loses to an explicit
+   * override. Unlike an override, an invalid sticky key (field gone,
+   * flags drifted, target side ineligible) falls through SILENTLY to
+   * auto-pick — the store records history, the user didn't type it.
+   */
+  sticky?: string;
 };
 
 /**
@@ -125,8 +133,11 @@ export type ResolveUpsertKeyOptions = {
  *
  * Resolution order:
  *   1. User override (when provided AND valid).
- *   2. Single candidate.
- *   3. Multiple candidates: pick by highest source population, with
+ *   2. Sticky key from a prior run (when still valid on BOTH sides) —
+ *      keeps re-seeds matching on the same external-id the original run
+ *      used, even if scope changes would auto-pick differently.
+ *   3. Single candidate.
+ *   4. Multiple candidates: pick by highest source population, with
  *      alphabetical name as the deterministic tiebreaker. If all
  *      candidates report zero populated source rows we return
  *      `ambiguous: "all-candidates-empty"` so the caller logs and INSERTs
@@ -169,6 +180,18 @@ export function resolveUpsertKey(
       };
     }
     return verifyTargetAndReturn(sourceDescribe, targetDescribe, matched.name);
+  }
+
+  // Sticky path: re-validate against the live describes every time. Any
+  // failure (not a source candidate, target missing/ineligible) falls
+  // through to the normal pick — the fresh pick then overwrites the store
+  // after the next successful run.
+  if (options.sticky !== undefined) {
+    const matched = sourceCandidates.find((c) => c.name === options.sticky);
+    if (matched !== undefined) {
+      const verdict = verifyTargetAndReturn(sourceDescribe, targetDescribe, matched.name);
+      if (verdict.kind === "picked") return verdict;
+    }
   }
 
   let pick: UpsertCandidate;

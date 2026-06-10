@@ -452,3 +452,59 @@ describe("pickByPopulation", () => {
     expect(result?.name).toBe("B__c");
   });
 });
+
+describe("resolveUpsertKey — sticky key from a prior run (T14 follow-up)", () => {
+  const eligible = (name: string) => mkField({ name, externalId: true, idLookup: true });
+
+  // Two candidates where population would pick A_Field__c (higher count),
+  // but a prior run used Z_Field__c.
+  const src = mkDescribe("Contact", [eligible("A_Field__c"), eligible("Z_Field__c")]);
+  const tgt = mkDescribe("Contact", [eligible("A_Field__c"), eligible("Z_Field__c")]);
+  const population = new Map([
+    ["A_Field__c", 100],
+    ["Z_Field__c", 5],
+  ]);
+
+  it("reuses the sticky key even when population would pick differently", () => {
+    const d = resolveUpsertKey(src, tgt, {
+      populationByField: population,
+      sticky: "Z_Field__c",
+    });
+    expect(d).toEqual({ kind: "picked", field: "Z_Field__c" });
+  });
+
+  it("explicit override beats the sticky key", () => {
+    const d = resolveUpsertKey(src, tgt, {
+      populationByField: population,
+      sticky: "Z_Field__c",
+      override: "A_Field__c",
+    });
+    expect(d).toEqual({ kind: "picked", field: "A_Field__c" });
+  });
+
+  it("invalid sticky (not a source candidate) falls through to auto-pick silently", () => {
+    const d = resolveUpsertKey(src, tgt, {
+      populationByField: population,
+      sticky: "Gone_Field__c",
+    });
+    expect(d).toEqual({ kind: "picked", field: "A_Field__c" });
+  });
+
+  it("sticky that drifted ineligible on the TARGET falls through to auto-pick", () => {
+    const driftedTgt = mkDescribe("Contact", [
+      eligible("A_Field__c"),
+      mkField({ name: "Z_Field__c", externalId: false, idLookup: false }),
+    ]);
+    const d = resolveUpsertKey(src, driftedTgt, {
+      populationByField: population,
+      sticky: "Z_Field__c",
+    });
+    expect(d).toEqual({ kind: "picked", field: "A_Field__c" });
+  });
+
+  it("sticky on a single-candidate object is a no-op (same pick)", () => {
+    const single = mkDescribe("Contact", [eligible("Only__c")]);
+    const d = resolveUpsertKey(single, single, { sticky: "Only__c" });
+    expect(d).toEqual({ kind: "picked", field: "Only__c" });
+  });
+});
