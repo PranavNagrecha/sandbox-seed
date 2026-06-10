@@ -88,4 +88,4 @@ See [AI_BOUNDARY.md](AI_BOUNDARY.md) for the full contract.
 - Multi-target fan-out (seed one source into N sandboxes in one flow)
 - Bulk API v2 for large volumes
 - Explicit user/owner remapping
-- First-class CLI `seed` command (today only `inspect` is CLI-available)
+- ~~First-class CLI `seed` command~~ — shipped: `sandbox-seed seed` / `seed resume` / `seed recover` (see [CLI.md](CLI.md))

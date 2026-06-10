@@ -63,12 +63,19 @@ npm i -g sandbox-seed
 
 Requires Node.js ≥ 20.
 
-The CLI currently ships one command — `inspect` — for read-only schema/dependency-graph exploration. Seeding is available through the MCP server (see above); a first-class `sandbox-seed seed` CLI command is on the roadmap.
+The CLI ships `inspect` (read-only schema/dependency-graph exploration) and a first-class `seed` command — the same engine and safety gates as the MCP tool, usable from a terminal or CI:
 
 ```bash
 sandbox-seed inspect --object Case
 sandbox-seed inspect --object Opportunity --include-counts --format mermaid
-sandbox-seed inspect --object Account --record-type Partner --target-org prod
+
+# Full seed flow: dry run → interactive confirm → run
+sandbox-seed seed --source-org prod --target-org dev-full \
+  --object Case --where "IsClosed = false AND CreatedDate = THIS_YEAR" --sample-size 100
+
+# Stop at the dry-run report; execute later after review
+sandbox-seed seed ... --mask --dry-run-only
+sandbox-seed seed resume <sessionId>
 ```
 
 Full CLI reference: [docs/CLI.md](docs/CLI.md).
