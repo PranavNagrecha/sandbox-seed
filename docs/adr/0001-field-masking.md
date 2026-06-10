@@ -1,6 +1,6 @@
 # ADR 0001 — Deterministic field masking (SF → SF)
 
-**Status:** Accepted — **production-blessed 2026-06-10**: the T14 real-org acceptance gate (a real HEDA-org FULL sandbox → a dev sandbox) passed G1–G6 on three consecutive runs. Evidence + findings: [notes/2026-06-10-t14-masking-acceptance.md](../../notes/2026-06-10-t14-masking-acceptance.md).
+**Status:** Accepted — **production-blessed 2026-06-10**: the T14 real-org acceptance gate (a real HEDA-org FULL sandbox → a dev sandbox) passed G1–G6 on three consecutive runs. Evidence + findings are recorded in the local project notes (untracked).
 **Date:** 2026-05-31
 **Spec:** [phases/masking-spec.md](../../phases/masking-spec.md) · **Plan:** [phases/masking-plan.md](../../phases/masking-plan.md)
 

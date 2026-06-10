@@ -578,7 +578,7 @@ describe("runExecute — UPSERT routing", () => {
  * causing every seeded custom-object row to land with Name=null. The
  * Lightning UI then falls back to displaying the raw 15-char Record ID
  * in list views ("aACVB000000AaTd" instead of "Acme College
- * Application"). Caught live against traa_Application_Template__c.
+ * Application"). Caught live against vnd_Application_Template__c.
  *
  * This test locks the invariant: if the source record has a Name and
  * the target has a createable Name field, the Name value MUST appear in
@@ -597,7 +597,7 @@ describe("runExecute — Name-field preservation on custom objects", () => {
 
   function mkCustomObjectDescribe(): SObjectDescribe {
     return {
-      name: "traa_Application_Template__c",
+      name: "vnd_Application_Template__c",
       label: "Application Template",
       custom: true,
       queryable: true,
@@ -645,7 +645,7 @@ describe("runExecute — Name-field preservation on custom objects", () => {
     return {
       nodes: new Map([
         [
-          "traa_Application_Template__c",
+          "vnd_Application_Template__c",
           {
             label: "Application Template",
             custom: true,
@@ -667,7 +667,7 @@ describe("runExecute — Name-field preservation on custom objects", () => {
 
   function mkCustomLoadPlan(): LoadPlan {
     return {
-      steps: [{ kind: "single", object: "traa_Application_Template__c" }],
+      steps: [{ kind: "single", object: "vnd_Application_Template__c" }],
       excluded: [],
     };
   }
@@ -696,7 +696,7 @@ describe("runExecute — Name-field preservation on custom objects", () => {
     });
 
     const desc = fakeDescribeClient({
-      traa_Application_Template__c: mkCustomObjectDescribe(),
+      vnd_Application_Template__c: mkCustomObjectDescribe(),
     });
 
     await runExecute({
@@ -705,9 +705,9 @@ describe("runExecute — Name-field preservation on custom objects", () => {
       sourceDescribe: desc,
       targetDescribe: desc,
       graph: mkCustomGraph(),
-      rootObject: "traa_Application_Template__c",
+      rootObject: "vnd_Application_Template__c",
       whereClause: "Id != null",
-      finalObjectList: ["traa_Application_Template__c"],
+      finalObjectList: ["vnd_Application_Template__c"],
       loadPlan: mkCustomLoadPlan(),
       sessionDir: tmp,
       fetchFn,

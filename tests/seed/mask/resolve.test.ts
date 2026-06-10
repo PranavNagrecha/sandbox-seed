@@ -72,12 +72,12 @@ describe("resolveMaskSelection — T8 simple defaults + overrides", () => {
     expect(sel.get("Contact")?.get("Phone")).toBe("auto");
   });
 
-  it("user can mask fields on an object with NO detected sensitives (e.g. a traa_ object)", () => {
-    const sel = resolveMaskSelection(graph({ traa_Employment_History__c: [] }), {
-      traa_Employment_History__c: ["Employer__c", "Supervisor_Name__c"],
+  it("user can mask fields on an object with NO detected sensitives (e.g. a vnd_ object)", () => {
+    const sel = resolveMaskSelection(graph({ vnd_Employment_History__c: [] }), {
+      vnd_Employment_History__c: ["Employer__c", "Supervisor_Name__c"],
     });
-    expect(sel.get("traa_Employment_History__c")?.get("Employer__c")).toBe("auto");
-    expect(sel.get("traa_Employment_History__c")?.get("Supervisor_Name__c")).toBe("auto");
+    expect(sel.get("vnd_Employment_History__c")?.get("Employer__c")).toBe("auto");
+    expect(sel.get("vnd_Employment_History__c")?.get("Supervisor_Name__c")).toBe("auto");
   });
 
   it("an object with every default opted out is dropped entirely", () => {

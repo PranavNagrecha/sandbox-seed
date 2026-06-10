@@ -2,7 +2,7 @@
 /**
  * T14 cleanup — delete the target rows a seed session inserted.
  *
- * the dev sandbox is a working sandbox, not disposable: the acceptance gate
+ * The acceptance-gate target is a shared working sandbox, not disposable: the gate
  * tracks every inserted target ID and removes it afterwards. Deletes are
  * scoped to THIS session's id-map, minus any entries that were already in
  * the project id-map before the run (pass the pre-run snapshot with

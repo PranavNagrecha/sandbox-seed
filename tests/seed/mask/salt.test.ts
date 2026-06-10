@@ -41,9 +41,9 @@ describe("masking salt store (T10)", () => {
     expect(mode).toBe(0o600);
   });
 
-  it("sanitizes aliases with spaces (real sandbox names like 'Excelsior FULL sandbox')", () => {
+  it("sanitizes aliases with spaces (real sandbox names like 'Full Copy Sandbox')", () => {
     expect(
-      saltPath({ sourceAlias: "Excelsior FULL sandbox", targetAlias: "DevCaseInt", rootDir: root }),
-    ).toBe(join(root, "id-maps", "Excelsior_FULL_sandbox__DevCaseInt.salt"));
+      saltPath({ sourceAlias: "Full Copy Sandbox", targetAlias: "DevTarget", rootDir: root }),
+    ).toBe(join(root, "id-maps", "Full_Copy_Sandbox__DevTarget.salt"));
   });
 });
