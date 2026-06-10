@@ -23,7 +23,7 @@ import { execFileSync } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { createMasker } from "../dist/seed/mask/registry.js";
+import { createMasker, pickStrategy } from "../dist/seed/mask/registry.js";
 import { MASKABLE_FIELD_TYPES } from "../dist/seed/mask/types.js";
 
 const args = process.argv.slice(2);
@@ -123,6 +123,7 @@ let copiedNonMaskable = 0; // (d)
 let copiedNonMaskableBad = 0;
 let encryptedDisplay = 0; // encryptedstring: display-masked both sides
 let encryptedDisplaySame = 0;
+let automationRewrites = 0; // target automation copied another masked field
 let rowsChecked = 0;
 let rowsMissingInTarget = 0;
 const consistency = new Map(); // srcValue → Set(targetValue)  (c)
@@ -195,7 +196,6 @@ for (const object of objects) {
       const derived = masker.apply({ object, field, value: sv });
       if (tv === derived) derivedMatch++;
       else {
-        derivedMismatch++;
         // Diagnose WITHOUT printing values: does the target value equal the
         // derived mask of a DIFFERENT masked field on this same row? That is
         // the signature of target-org automation (e.g. HEDA preferred-email
@@ -219,22 +219,42 @@ for (const object of objects) {
           tv.length > 0 &&
           tv.length < derived.length &&
           derived.startsWith(tv);
+        if (matchedOther !== null) {
+          // Target-org automation (e.g. HEDA preferred-phone/email sync)
+          // rewrote this field with the mask of ANOTHER masked field after
+          // our insert. Provably still a masked artifact — warn, don't fail,
+          // and keep it OUT of the consistency groups (it is not the
+          // masker's output for THIS source value).
+          automationRewrites++;
+          mismatchDiagnostics.push(
+            `${object}.${fname}: target equals the mask of ${object}.${matchedOther} (automation copy — WARN)`,
+          );
+          if (tv === sv) leak++;
+          continue;
+        }
+        derivedMismatch++;
         mismatchDiagnostics.push(
           `${object}.${fname}: target ${
             tv === null || tv === ""
               ? "is EMPTY (automation cleared it)"
-              : matchedOther !== null
-                ? `equals the mask of ${object}.${matchedOther} (automation copy)`
-                : truncated
-                  ? `is the derived mask TRUNCATED to ${tv.length} chars (target field length)`
-                  : "is some other value (unexplained)"
+              : truncated
+                ? `is the derived mask TRUNCATED to ${tv.length} chars (target field length)`
+                : "is some other value (unexplained)"
           }`,
         );
       }
       if (tv === sv) leak++;
-      const group = consistency.get(sv) ?? new Set();
+      // G4 group key: (resolved preset, source value). The seed is keyed by
+      // value alone, but the PRESET is per-field — the same value in a phone
+      // field and a postal field masks to two different (deterministic)
+      // shapes by design. Identical-output is only promised within a preset
+      // family (the cross-object join case: email↔email, phone↔phone).
+      const strat = selection.get(object)?.get(fname) ?? "auto";
+      const resolved = strat === "auto" ? pickStrategy(field) : strat;
+      const groupKey = `${resolved}:${sv}`;
+      const group = consistency.get(groupKey) ?? new Set();
       group.add(String(tv));
-      consistency.set(sv, group);
+      consistency.set(groupKey, group);
     }
   }
 }
@@ -260,7 +280,8 @@ console.log(
 );
 console.log(`rows missing       ${rowsMissingInTarget}`);
 console.log(`derived == target  ${derivedMatch}   (G3a: mask present)`);
-console.log(`derived != target  ${derivedMismatch}`);
+console.log(`derived != target  ${derivedMismatch}   (unexplained — fails the gate)`);
+console.log(`automation rewrite ${automationRewrites}   (target automation copied another masked field — WARN)`);
 for (const d of mismatchDiagnostics) console.log(`  ↳ ${d}`);
 console.log(`source leaked      ${leak}   (G3b: must be 0)`);
 console.log(`empties preserved  ${passthroughOk} ok / ${passthroughBad} bad`);
