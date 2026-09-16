@@ -33,8 +33,13 @@ export type ListOrgsResult = {
  * result-schema validator rejected the bare-array return with
  * `Invalid input: expected record, received array`.
  */
-export async function listOrgs(): Promise<ListOrgsResult> {
-  const raw = await runSfOrgList();
+export type ListOrgsOptions = {
+  /** Injected for tests — replaces spawning the real `sf org list --json`. */
+  runSfOrgList?: () => Promise<Record<string, unknown> | null>;
+};
+
+export async function listOrgs(opts: ListOrgsOptions = {}): Promise<ListOrgsResult> {
+  const raw = await (opts.runSfOrgList ?? runSfOrgList)();
   if (raw === null) return { orgs: [], count: 0 };
 
   const result = (raw.result ?? raw) as Record<string, unknown>;

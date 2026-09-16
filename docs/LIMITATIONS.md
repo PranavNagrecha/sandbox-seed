@@ -44,7 +44,7 @@ For the overall scope of the 0.2.x line and the AI-boundary contract, see the [R
 
 ## Auth
 
-**Encrypted sfdx tokens require the `sf` CLI.** The project reads `~/.sf/` auth files; if the target tokens are encrypted, `sf` must be on `PATH` to decrypt them. The OAuth device flow is the only alternative — there is no JWT bearer flow.
+**Encrypted sfdx tokens require the `sf` CLI.** The project delegates to `sf` to decrypt and refresh tokens; the only alternative is a plaintext `~/.sfdx/<username>.json` from an older install. There is no OAuth device flow or JWT bearer flow of its own — set those up in `sf` (`sf org login jwt`) and the tool consumes them.
 
 **No multi-user auth isolation.** The tool uses whichever auth is active for the sf alias. If multiple users share a workstation and the alias points at a different user's token, the seed runs as that user.
 
