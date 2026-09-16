@@ -1,4 +1,4 @@
-import type { OrgAuth } from "../auth/sf-auth.ts";
+import { type OrgAuth, tokenRejectedHint } from "../auth/sf-auth.ts";
 import type { DependencyGraph, EdgeAttrs } from "../graph/build.ts";
 import { ApiError, salesforceErrorSummary, UserError } from "../errors.ts";
 import { salesforceFetch } from "../salesforce-fetch.ts";
@@ -334,7 +334,7 @@ async function doGet(
   if (res.status === 401) {
     throw new ApiError(
       `Authentication rejected by Salesforce (HTTP 401).`,
-      `Token may be expired. Run \`sf org login web --alias ${auth.alias ?? auth.username}\` to refresh.`,
+      tokenRejectedHint(auth),
     );
   }
   if (!res.ok) {

@@ -157,6 +157,7 @@ Then for each subsequent step, paste back the JSON the agent suggests:
 
 ## What's shipped in 0.2.x
 
+- **Works with Salesforce CLI ≥ 2.149** (fixed in 0.2.9) — newer `sf` redacts the access token from `sf org display`, which turned every request into an opaque HTTP 401. Auth now recovers the token via `sf org auth show-access-token`, shape-checks it before it can reach a `Bearer` header, and turns a failed pre-flight session refresh, an unknown alias, or a crashed `sf` into a precise resolve-time error instead. See [docs/AUTH.md](docs/AUTH.md).
 - **First-class CLI `seed` command** (new in 0.2.8) — `sandbox-seed seed` / `seed resume` / `seed recover` drive the same engine and safety gates as the MCP tool from a terminal or CI (`--dry-run-only`, `--yes`, `--json`).
 - **Parallel describe walk** (new in 0.2.8) — cold-cache `analyze`/`inspect` fan describes out 6 at a time; full-graph analyze on managed-package-heavy orgs dropped from 30–90s to ~5–20s.
 - **Masking production-blessed** (0.2.8) — the real-org acceptance gate passed G1–G6 on three consecutive runs; adds a digit-shaped `postal-code` preset, masked values cap to the shorter of source/target field length, and the dry-run report warns when a masked field is shorter on the target.
@@ -180,8 +181,8 @@ Not yet shipped: synthetic data generation, CSV import, multi-target fan-out. Th
 
 ## Authentication
 
-- Reads `~/.sf/` auth files if you already use the Salesforce CLI (`sf`). Zero config.
-- Falls back to an OAuth device flow if you don't have `sf` installed.
+- Delegates to the Salesforce CLI (`sf`) if you already use it. Zero config — and it copes with Salesforce CLI ≥ 2.149 redacting the token from `sf org display`.
+- Falls back to reading a plaintext `~/.sfdx/<username>.json` if `sf` isn't installed.
 - Target org must be a sandbox. Production targets are refused.
 
 More: [docs/AUTH.md](docs/AUTH.md).
@@ -190,7 +191,7 @@ More: [docs/AUTH.md](docs/AUTH.md).
 
 ## Status
 
-Pre-release (`0.2.8`). APIs and flags may change before `1.0`. Use in sandboxes only — **never** point this at a production org as the target (the tool refuses, but don't test the refusal with real money).
+Pre-release (`0.2.9`). APIs and flags may change before `1.0`. Use in sandboxes only — **never** point this at a production org as the target (the tool refuses, but don't test the refusal with real money).
 
 Roadmap: [BACKLOG in project notes, soon to be moved into GitHub Issues].
 

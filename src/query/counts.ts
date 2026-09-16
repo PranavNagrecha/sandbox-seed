@@ -1,4 +1,4 @@
-import type { OrgAuth } from "../auth/sf-auth.ts";
+import { type OrgAuth, tokenRejectedHint } from "../auth/sf-auth.ts";
 import { ApiError } from "../errors.ts";
 import { salesforceFetch } from "../salesforce-fetch.ts";
 
@@ -43,7 +43,7 @@ export async function fetchRowCounts(opts: FetchCountsOptions): Promise<Map<stri
       if (res.status === 401) {
         throw new ApiError(
           `Authentication rejected while fetching row counts (HTTP 401).`,
-          `Token may be expired. Re-run \`sf org login\`.`,
+          tokenRejectedHint(opts.auth),
         );
       }
       continue;

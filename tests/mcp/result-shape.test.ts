@@ -118,20 +118,35 @@ describe("tool-result shape (structuredContent must be a record)", () => {
   });
 
   it("list_orgs: object shape (not a bare array)", async () => {
-    // Mock sf CLI out — listOrgs normally shells out to `sf org list --json`.
-    // We don't need it to succeed; we just need it to return an object shape.
-    const result = await listOrgs();
+    // Stub the sf CLI out — listOrgs normally shells out to `sf org list --json`,
+    // which takes several seconds on a machine with many authorised orgs. The
+    // canned envelope mirrors sf's real shape (sandboxes also appear in
+    // nonScratchOrgs) so the dedup path runs too.
+    const result = await listOrgs({
+      runSfOrgList: async () => ({
+        status: 0,
+        result: {
+          nonScratchOrgs: [
+            { alias: "dev", username: "u@example.dev", orgId: "00D000000000001", isSandbox: true },
+          ],
+          sandboxes: [
+            { alias: "dev", username: "u@example.dev", orgId: "00D000000000001", isSandbox: true },
+          ],
+          scratchOrgs: [],
+          other: [],
+        },
+      }),
+    });
     assertPlainObject(result, "list_orgs");
     expect(result).toHaveProperty("orgs");
     expect(result).toHaveProperty("count");
     expect(Array.isArray(result.orgs)).toBe(true);
+    expect(result.count).toBe(1);
+    expect(result.orgs[0]).toMatchObject({ alias: "dev", isSandbox: true });
   });
 
   it("describe_global: object shape", async () => {
-    const result = await describeGlobal(
-      {},
-      { auth: fakeAuth(), fetchFn: makeFetch(), cacheRoot },
-    );
+    const result = await describeGlobal({}, { auth: fakeAuth(), fetchFn: makeFetch(), cacheRoot });
     assertPlainObject(result, "describe_global");
   });
 

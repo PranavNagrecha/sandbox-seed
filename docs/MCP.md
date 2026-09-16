@@ -270,7 +270,7 @@ sf org login web --alias prod
 sf org login web --alias dev-full
 ```
 
-See [AUTH.md](AUTH.md) for details and the OAuth-device-flow fallback.
+See [AUTH.md](AUTH.md) for details, including how the tool copes with Salesforce CLI ≥ 2.149 redacting the token from `sf org display`, and what each resolve-time auth error means.
 
 ### "It says the target isn't a sandbox"
 
@@ -282,7 +282,7 @@ The MCP transport is stdio-based. Anything written to `stdout` other than valid 
 
 ### "INVALID_SESSION_ID" or "Token expired" mid-run
 
-The Salesforce access token in `~/.sf/` expired while the seed was executing. The tool does not refresh mid-run. Re-login (`sf org login web --alias <name>`) for whichever org errored, then re-invoke the flow. If the error fired during `run`, the session's already-inserted rows are preserved in the project id-map, so re-running the same session picks up where it stopped (upsert-keyed objects match-and-update; non-keyed objects skip via cross-run dedup).
+The Salesforce access token `sf` supplied expired (or was revoked) while the seed was executing. The tool does not refresh mid-run. (If instead the error fires *before* any work starts — `could not refresh the session`, `did not expose a usable access token`, … — see [AUTH.md](AUTH.md): those are caught at resolve time and say what to do.) Re-login (`sf org login web --alias <name>`) for whichever org errored, then re-invoke the flow. If the error fired during `run`, the session's already-inserted rows are preserved in the project id-map, so re-running the same session picks up where it stopped (upsert-keyed objects match-and-update; non-keyed objects skip via cross-run dedup).
 
 ### `INVALID_CROSS_REFERENCE_KEY` on insert
 

@@ -1,6 +1,6 @@
 {
   "name": "sandbox-seed",
-  "version": "0.2.8",
+  "version": "0.2.9",
   "description": "Salesforce sandbox seeding CLI + MCP server: SOQL-scoped org-to-org copy with dependency-graph walking, cross-org FK remapping, deterministic PII masking, and a hard AI-never-sees-your-data boundary.",
   "license": "Apache-2.0",
   "author": "Pranav Nagrecha",
